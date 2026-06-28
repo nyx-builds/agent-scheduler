@@ -23,6 +23,8 @@ from agent_scheduler.models import (
 )
 from agent_scheduler.scheduler import Scheduler
 from agent_scheduler.store import JSONJobStore
+from agent_scheduler.webhook import Webhook, WebhookEvent, WebhookManager
+from agent_scheduler.templates import JobTemplate, TemplateCategory, TemplateManager, BUILTIN_TEMPLATES
 
 console = Console()
 
@@ -442,6 +444,404 @@ def start(ctx: click.Context) -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         console.print("\n[yellow]Scheduler stopped.[/yellow]")
+
+
+# ── Webhook Commands ───────────────────────────────────────────
+
+@cli.group("webhook")
+@click.pass_context
+def webhook_group(ctx: click.Context) -> None:
+    """Manage webhook notifications."""
+    pass
+
+
+@webhook_group.command("add")
+@click.option("--name", required=True, help="Webhook name")
+@click.option("--url", required=True, help="Webhook URL to POST to")
+@click.option("--secret", default=None, help="HMAC signing secret")
+@click.option("--events", default=None, help="Comma-separated event list (default: all)")
+@click.option("--tags", default=None, help="Comma-separated job tags to filter (default: all)")
+@click.option("--timeout", default=10.0, type=float, help="HTTP timeout in seconds")
+@click.option("--max-retries", default=3, type=int, help="Max delivery retries")
+@click.pass_context
+def webhook_add(
+    ctx: click.Context,
+    name: str,
+    url: str,
+    secret: Optional[str],
+    events: Optional[str],
+    tags: Optional[str],
+    timeout: float,
+    max_retries: int,
+) -> None:
+    """Create a new webhook subscription."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = scheduler.webhooks
+    if manager is None:
+        console.print("[red]Webhook support not available.[/red]")
+        sys.exit(1)
+
+    event_list = None
+    if events:
+        event_list = [WebhookEvent(e.strip()) for e in events.split(",") if e.strip()]
+
+    tag_list = []
+    if tags:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    webhook = Webhook(
+        name=name,
+        url=url,
+        secret=secret,
+        events=event_list if event_list else [e for e in WebhookEvent],
+        tags=tag_list,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+    manager.create_webhook(webhook)
+    console.print(Panel(
+        f"[green]Webhook created![/green]\n\n"
+        f"  ID: {webhook.id}\n"
+        f"  Name: {webhook.name}\n"
+        f"  URL: {webhook.url}\n"
+        f"  Events: {', '.join(e.value for e in webhook.events)}\n"
+        f"  Tags filter: {', '.join(webhook.tags) if webhook.tags else 'All'}\n"
+        f"  Max retries: {webhook.max_retries}",
+        title="Webhook Added",
+    ))
+
+
+@webhook_group.command("list")
+@click.pass_context
+def webhook_list(ctx: click.Context) -> None:
+    """List all webhook subscriptions."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = scheduler.webhooks
+    if manager is None:
+        console.print("[red]Webhook support not available.[/red]")
+        sys.exit(1)
+    webhooks = manager.list_webhooks()
+
+    if not webhooks:
+        console.print("[dim]No webhooks found.[/dim]")
+        return
+
+    table = Table(title="Webhook Subscriptions", show_lines=True)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="white")
+    table.add_column("URL", style="blue")
+    table.add_column("Events", style="magenta")
+    table.add_column("Tags", style="yellow")
+    table.add_column("Enabled", style="green")
+    table.add_column("Retries", justify="right")
+
+    for wh in webhooks:
+        events_str = ", ".join(e.value for e in wh.events)
+        if len(events_str) > 40:
+            events_str = events_str[:37] + "..."
+        tags_str = ", ".join(wh.tags) if wh.tags else "All"
+        enabled = "[green]✓[/green]" if wh.enabled else "[red]✗[/red]"
+
+        table.add_row(
+            wh.id,
+            wh.name,
+            wh.url[:50] + "..." if len(wh.url) > 50 else wh.url,
+            events_str,
+            tags_str,
+            enabled,
+            str(wh.max_retries),
+        )
+
+    console.print(table)
+
+
+@webhook_group.command("delete")
+@click.argument("webhook_id")
+@click.option("--force", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def webhook_delete(ctx: click.Context, webhook_id: str, force: bool) -> None:
+    """Delete a webhook subscription."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = scheduler.webhooks
+    if manager is None:
+        console.print("[red]Webhook support not available.[/red]")
+        sys.exit(1)
+    webhook = manager.get_webhook(webhook_id)
+    if webhook is None:
+        console.print(f"[red]Webhook not found: {webhook_id}[/red]")
+        sys.exit(1)
+
+    if not force:
+        if not click.confirm(f"Delete webhook '{webhook.name}'?"):
+            return
+
+    manager.delete_webhook(webhook_id)
+    console.print(f"[red]Webhook '{webhook.name}' deleted.[/red]")
+
+
+@webhook_group.command("deliveries")
+@click.option("--webhook-id", default=None, help="Filter by webhook ID")
+@click.option("--limit", default=20, type=int, help="Number of records")
+@click.pass_context
+def webhook_deliveries(ctx: click.Context, webhook_id: Optional[str], limit: int) -> None:
+    """Show webhook delivery history."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = scheduler.webhooks
+    if manager is None:
+        console.print("[red]Webhook support not available.[/red]")
+        sys.exit(1)
+    deliveries = manager.get_deliveries(webhook_id=webhook_id, limit=limit)
+
+    if not deliveries:
+        console.print("[dim]No webhook deliveries found.[/dim]")
+        return
+
+    table = Table(title="Webhook Deliveries", show_lines=True)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Webhook", style="white")
+    table.add_column("Event", style="magenta")
+    table.add_column("Job", style="blue")
+    table.add_column("Status", style="green")
+    table.add_column("HTTP Code", justify="right")
+    table.add_column("Attempt", justify="right")
+    table.add_column("Error", style="red")
+
+    for d in deliveries:
+        status_style = "green" if d.status.value == "delivered" else "red"
+        error = (d.error or "—")[:40]
+
+        table.add_row(
+            d.id,
+            d.webhook_id,
+            d.event.value,
+            d.job_name,
+            f"[{status_style}]{d.status.value}[/{status_style}]",
+            str(d.status_code or "—"),
+            str(d.attempt),
+            error,
+        )
+
+    console.print(table)
+
+
+# ── Template Commands ──────────────────────────────────────────
+
+@cli.group("template")
+@click.pass_context
+def template_group(ctx: click.Context) -> None:
+    """Manage job templates."""
+    pass
+
+
+@template_group.command("list")
+@click.option("--category", default=None, type=click.Choice([c.value for c in TemplateCategory]))
+@click.pass_context
+def template_list(ctx: click.Context, category: Optional[str]) -> None:
+    """List available job templates."""
+    manager = TemplateManager(store=JSONJobStore(data_dir=ctx.obj["data_dir"]))
+    cat = TemplateCategory(category) if category else None
+    templates = manager.list_templates(category=cat)
+
+    if not templates:
+        console.print("[dim]No templates found.[/dim]")
+        return
+
+    table = Table(title="Job Templates", show_lines=True)
+    table.add_column("Name", style="cyan")
+    table.add_column("Category", style="magenta")
+    table.add_column("Handler", style="blue")
+    table.add_column("Description", style="white")
+    table.add_column("Default Cron", style="green")
+    table.add_column("Priority", style="yellow")
+    table.add_column("Required Fields", style="red")
+
+    for t in templates:
+        table.add_row(
+            t.name,
+            t.category.value,
+            t.handler,
+            t.description[:50] + "..." if len(t.description) > 50 else t.description,
+            t.default_cron or "—",
+            t.default_priority.value,
+            ", ".join(t.required_fields) if t.required_fields else "—",
+        )
+
+    console.print(table)
+
+
+@template_group.command("show")
+@click.argument("template_name")
+@click.pass_context
+def template_show(ctx: click.Context, template_name: str) -> None:
+    """Show detailed information about a template."""
+    manager = TemplateManager(store=JSONJobStore(data_dir=ctx.obj["data_dir"]))
+    template = manager.get_template_by_name(template_name)
+    if template is None:
+        console.print(f"[red]Template not found: {template_name}[/red]")
+        sys.exit(1)
+
+    info = (
+        f"  [cyan]Name:[/cyan] {template.name}\n"
+        f"  [cyan]Description:[/cyan] {template.description}\n"
+        f"  [cyan]Category:[/cyan] {template.category.value}\n"
+        f"  [cyan]Handler:[/cyan] {template.handler}\n"
+        f"  [cyan]Default Cron:[/cyan] {template.default_cron or 'N/A'}\n"
+        f"  [cyan]Default Priority:[/cyan] {template.default_priority.value}\n"
+        f"  [cyan]Default Timeout:[/cyan] {template.default_timeout}s\n"
+        f"  [cyan]Default Tags:[/cyan] {', '.join(template.default_tags) or 'None'}\n"
+        f"  [cyan]Default Max Retries:[/cyan] {template.default_max_retries}\n"
+        f"  [cyan]Default Payload:[/cyan] {json.dumps(template.default_payload, indent=2)}\n"
+        f"  [cyan]Required Fields:[/cyan] {', '.join(template.required_fields) or 'None'}\n"
+        f"  [cyan]Optional Fields:[/cyan] {', '.join(template.optional_fields) or 'None'}"
+    )
+
+    console.print(Panel(info, title=f"Template: {template.name}"))
+
+
+@template_group.command("use")
+@click.argument("template_name")
+@click.option("--name", default=None, help="Job name (default: auto-generated)")
+@click.option("--cron", default=None, help="Override cron expression")
+@click.option("--priority", default=None, type=click.Choice(["low", "normal", "high"]))
+@click.option("--payload", default=None, help="JSON payload overrides")
+@click.option("--tags", default=None, help="Additional comma-separated tags")
+@click.pass_context
+def template_use(
+    ctx: click.Context,
+    template_name: str,
+    name: Optional[str],
+    cron: Optional[str],
+    priority: Optional[str],
+    payload: Optional[str],
+    tags: Optional[str],
+) -> None:
+    """Create a job from a template."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = TemplateManager(store=JSONJobStore(data_dir=ctx.obj["data_dir"]))
+
+    # Build overrides
+    overrides: dict = {}
+    if name:
+        overrides["name"] = name
+    if cron:
+        overrides["cron"] = cron
+    if priority:
+        overrides["priority"] = Priority(priority)
+    if tags:
+        overrides["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    if payload:
+        try:
+            overrides["payload"] = json.loads(payload)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON payload: {e}[/red]")
+            sys.exit(1)
+
+    try:
+        job = manager.instantiate(template_name, **overrides)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    scheduler.add_job(job)
+    console.print(Panel(
+        f"[green]Job created from template '{template_name}'![/green]\n\n"
+        f"  ID: {job.id}\n"
+        f"  Name: {job.name}\n"
+        f"  Handler: {job.handler}\n"
+        f"  Cron: {job.cron or 'N/A'}\n"
+        f"  Priority: {job.priority.value}",
+        title="Job Created from Template",
+    ))
+
+
+@template_group.command("add")
+@click.option("--name", required=True, help="Template name")
+@click.option("--handler", required=True, help="Default handler function")
+@click.option("--description", default="", help="Template description")
+@click.option("--category", default="custom", type=click.Choice([c.value for c in TemplateCategory]))
+@click.option("--cron", default=None, help="Default cron expression")
+@click.option("--priority", default="normal", type=click.Choice(["low", "normal", "high"]))
+@click.option("--timeout", default=300, type=float, help="Default timeout")
+@click.option("--max-retries", default=0, type=int, help="Default max retries")
+@click.option("--tags", default=None, help="Default comma-separated tags")
+@click.option("--required-fields", default=None, help="Comma-separated required field names")
+@click.option("--payload", default=None, help="Default JSON payload")
+@click.pass_context
+def template_add(
+    ctx: click.Context,
+    name: str,
+    handler: str,
+    description: str,
+    category: str,
+    cron: Optional[str],
+    priority: str,
+    timeout: float,
+    max_retries: int,
+    tags: Optional[str],
+    required_fields: Optional[str],
+    payload: Optional[str],
+) -> None:
+    """Create a new custom job template."""
+    manager = TemplateManager(store=JSONJobStore(data_dir=ctx.obj["data_dir"]))
+
+    tag_list = []
+    if tags:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+    required = []
+    if required_fields:
+        required = [f.strip() for f in required_fields.split(",") if f.strip()]
+
+    default_payload = {}
+    if payload:
+        try:
+            default_payload = json.loads(payload)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON payload: {e}[/red]")
+            sys.exit(1)
+
+    template = JobTemplate(
+        name=name,
+        description=description,
+        category=TemplateCategory(category),
+        handler=handler,
+        default_cron=cron,
+        default_priority=Priority(priority),
+        default_timeout=timeout,
+        default_max_retries=max_retries,
+        default_tags=tag_list,
+        default_payload=default_payload,
+        required_fields=required,
+    )
+    manager.create_template(template)
+    console.print(Panel(
+        f"[green]Template created![/green]\n\n"
+        f"  ID: {template.id}\n"
+        f"  Name: {template.name}\n"
+        f"  Handler: {template.handler}\n"
+        f"  Category: {template.category.value}",
+        title="Template Added",
+    ))
+
+
+# ── API Server Command ─────────────────────────────────────────
+
+@cli.command("api")
+@click.option("--host", default="0.0.0.0", help="Bind host")
+@click.option("--port", default=8080, type=int, help="Bind port")
+@click.pass_context
+def api_server(ctx: click.Context, host: str, port: int) -> None:
+    """Start the REST API server."""
+    from agent_scheduler.api import run_api_server
+
+    data_dir = ctx.obj["data_dir"]
+    console.print(f"[green]Starting REST API server on {host}:{port}...[/green]")
+    console.print("[dim]Press Ctrl+C to stop.[/dim]")
+
+    try:
+        asyncio.run(run_api_server(host=host, port=port, data_dir=data_dir))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]API server stopped.[/yellow]")
 
 
 if __name__ == "__main__":

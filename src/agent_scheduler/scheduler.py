@@ -19,6 +19,7 @@ from agent_scheduler.models import (
 )
 from agent_scheduler.handler import HandlerRegistry, get_default_registry
 from agent_scheduler.store import JobStore, JSONJobStore
+from agent_scheduler.webhook import WebhookEvent, WebhookManager
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +43,19 @@ class Scheduler:
         self,
         store: Optional[JobStore] = None,
         handler_registry: Optional[HandlerRegistry] = None,
+        webhook_manager: Optional[WebhookManager] = None,
         poll_interval: float = 1.0,
         max_concurrent: int = 10,
     ) -> None:
         self.store = store or JSONJobStore()
         self.handlers = handler_registry or get_default_registry()
+        self.webhooks = webhook_manager
+        if self.webhooks is None and self.store is not None:
+            # Auto-initialize webhook manager with the store
+            try:
+                self.webhooks = WebhookManager(store=self.store)
+            except Exception:
+                pass
         self.poll_interval = poll_interval
         self.max_concurrent = max_concurrent
 
@@ -260,6 +269,10 @@ class Scheduler:
                 # Trigger dependent jobs
                 await self._trigger_dependents(job.id, execution.status)
 
+                # Fire webhook for job completion
+                if self.webhooks:
+                    await self.webhooks.fire_event(WebhookEvent.JOB_COMPLETED, job, execution)
+
                 logger.info(f"Job '{job.name}' executed successfully (attempt {attempt + 1})")
                 return execution
             else:
@@ -277,6 +290,11 @@ class Scheduler:
                             f"retrying in {backoff}s: {last_error}"
                         )
                         await asyncio.sleep(min(backoff, 1))  # Cap sleep for testing
+
+                        # Fire retry webhook
+                        if self.webhooks:
+                            await self.webhooks.fire_event(WebhookEvent.JOB_RETRY, job, execution)
+
                         continue
 
                 # Final failure
@@ -300,6 +318,11 @@ class Scheduler:
 
         # Trigger dependents on failure too
         await self._trigger_dependents(job.id, execution.status)
+
+        # Fire failure/timeout webhook
+        if self.webhooks:
+            event = WebhookEvent.JOB_TIMEOUT if execution.status == ExecutionStatus.TIMEOUT else WebhookEvent.JOB_FAILED
+            await self.webhooks.fire_event(event, job, execution)
 
         logger.error(f"Job '{job.name}' failed: {last_error}")
         return execution

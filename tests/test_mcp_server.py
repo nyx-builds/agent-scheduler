@@ -217,3 +217,118 @@ class TestMCPServerTools:
     async def test_unknown_tool(self, mcp_server):
         result = await mcp_server.handle_tool_call("nonexistent_tool", {})
         assert "error" in result
+
+    # ── Webhook Tools ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_create_webhook(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_create_webhook", {
+            "name": "test-hook",
+            "url": "https://example.com/webhook",
+            "events": ["job.completed", "job.failed"],
+            "tags": ["monitoring"],
+        })
+        assert "webhook" in result
+        assert result["webhook"]["name"] == "test-hook"
+
+    @pytest.mark.asyncio
+    async def test_list_webhooks(self, mcp_server):
+        await mcp_server.handle_tool_call("scheduler_create_webhook", {
+            "name": "hook1", "url": "https://a.com/hook",
+        })
+        await mcp_server.handle_tool_call("scheduler_create_webhook", {
+            "name": "hook2", "url": "https://b.com/hook",
+        })
+        result = await mcp_server.handle_tool_call("scheduler_list_webhooks", {})
+        assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_delete_webhook(self, mcp_server):
+        create_result = await mcp_server.handle_tool_call("scheduler_create_webhook", {
+            "name": "deletable", "url": "https://a.com/hook",
+        })
+        webhook_id = create_result["webhook"]["id"]
+        result = await mcp_server.handle_tool_call("scheduler_delete_webhook", {
+            "webhook_id": webhook_id,
+        })
+        assert "message" in result
+
+    @pytest.mark.asyncio
+    async def test_delete_webhook_not_found(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_delete_webhook", {
+            "webhook_id": "nonexistent",
+        })
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_get_webhook_deliveries(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_get_webhook_deliveries", {})
+        assert "deliveries" in result
+        assert result["count"] == 0
+
+    # ── Template Tools ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_list_templates(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_list_templates", {})
+        assert "templates" in result
+        assert result["count"] >= 5  # Built-in templates
+        names = [t["name"] for t in result["templates"]]
+        assert "health-check" in names
+
+    @pytest.mark.asyncio
+    async def test_list_templates_by_category(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_list_templates", {
+            "category": "monitoring",
+        })
+        assert result["count"] >= 1
+        for t in result["templates"]:
+            assert t["category"] == "monitoring"
+
+    @pytest.mark.asyncio
+    async def test_get_template(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_get_template", {
+            "template_name": "health-check",
+        })
+        assert "template" in result
+        assert result["template"]["name"] == "health-check"
+
+    @pytest.mark.asyncio
+    async def test_get_template_not_found(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_get_template", {
+            "template_name": "nonexistent",
+        })
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_instantiate_template(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_instantiate_template", {
+            "template_name": "health-check",
+            "payload": {"endpoint": "https://api.example.com/health"},
+        })
+        assert "job" in result
+        assert result["job"]["handler"] == "health.check"
+        assert result["job"]["priority"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_instantiate_template_not_found(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_instantiate_template", {
+            "template_name": "nonexistent",
+        })
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_create_template(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_create_template", {
+            "name": "custom-template",
+            "handler": "custom.handler",
+            "description": "My custom template",
+            "category": "custom",
+        })
+        assert "template" in result
+        assert result["template"]["name"] == "custom-template"
+
+    @pytest.mark.asyncio
+    async def test_tool_count(self):
+        """Verify we have at least 20 tools (15 original + webhook + template)."""
+        assert len(TOOLS) >= 20

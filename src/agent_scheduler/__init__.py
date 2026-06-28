@@ -1,6 +1,6 @@
 """Agent Scheduler — Task scheduling engine for autonomous agents."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from agent_scheduler.models import (
     Job,
@@ -12,6 +12,8 @@ from agent_scheduler.models import (
 )
 from agent_scheduler.scheduler import Scheduler
 from agent_scheduler.handler import HandlerRegistry
+from agent_scheduler.webhook import Webhook, WebhookEvent, WebhookManager
+from agent_scheduler.templates import JobTemplate, TemplateCategory, TemplateManager
 
 __all__ = [
     "Job",
@@ -22,4 +24,10 @@ __all__ = [
     "Priority",
     "Scheduler",
     "HandlerRegistry",
+    "Webhook",
+    "WebhookEvent",
+    "WebhookManager",
+    "JobTemplate",
+    "TemplateCategory",
+    "TemplateManager",
 ]

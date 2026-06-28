@@ -17,6 +17,8 @@ from agent_scheduler.models import (
 )
 from agent_scheduler.scheduler import Scheduler
 from agent_scheduler.store import JSONJobStore
+from agent_scheduler.webhook import Webhook, WebhookEvent, WebhookManager
+from agent_scheduler.templates import JobTemplate, TemplateCategory, TemplateManager
 
 
 def _job_to_dict(job: Job) -> dict[str, Any]:
@@ -214,14 +216,124 @@ TOOLS = [
             "required": ["job_identifier"],
         },
     },
+    # ── Webhook Tools ───────────────────────────────────────
+    {
+        "name": "scheduler_create_webhook",
+        "description": "Create a webhook subscription to receive HTTP callbacks on job events (completion, failure, retry, etc.).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Webhook name"},
+                "url": {"type": "string", "description": "HTTP(S) URL to POST event payloads to"},
+                "secret": {"type": "string", "description": "HMAC-SHA256 signing secret for payload verification"},
+                "events": {"type": "array", "items": {"type": "string"}, "description": "Events to subscribe to (e.g. ['job.completed', 'job.failed'])"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Only fire for jobs with these tags (empty = all)"},
+                "max_retries": {"type": "integer", "description": "Max delivery retry attempts", "default": 3},
+                "timeout": {"type": "number", "description": "HTTP request timeout in seconds", "default": 10},
+            },
+            "required": ["name", "url"],
+        },
+    },
+    {
+        "name": "scheduler_list_webhooks",
+        "description": "List all webhook subscriptions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled_only": {"type": "boolean", "description": "Show only enabled webhooks", "default": False},
+            },
+        },
+    },
+    {
+        "name": "scheduler_delete_webhook",
+        "description": "Delete a webhook subscription.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "webhook_id": {"type": "string", "description": "Webhook ID"},
+            },
+            "required": ["webhook_id"],
+        },
+    },
+    {
+        "name": "scheduler_get_webhook_deliveries",
+        "description": "Get webhook delivery history (success/failure records).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "webhook_id": {"type": "string", "description": "Filter by webhook ID"},
+                "limit": {"type": "integer", "description": "Number of records", "default": 50},
+            },
+        },
+    },
+    # ── Template Tools ──────────────────────────────────────
+    {
+        "name": "scheduler_list_templates",
+        "description": "List available job templates (built-in and custom).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "Filter by category", "enum": ["monitoring", "backup", "reporting", "maintenance", "notification", "data-pipeline", "custom"]},
+            },
+        },
+    },
+    {
+        "name": "scheduler_get_template",
+        "description": "Get detailed information about a job template.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_name": {"type": "string", "description": "Template name"},
+            },
+            "required": ["template_name"],
+        },
+    },
+    {
+        "name": "scheduler_instantiate_template",
+        "description": "Create a job from a template with optional overrides.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template_name": {"type": "string", "description": "Template name to use"},
+                "name": {"type": "string", "description": "Job name (default: auto-generated)"},
+                "cron": {"type": "string", "description": "Override cron expression"},
+                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                "payload": {"type": "object", "description": "Override/additional payload values"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Additional tags"},
+            },
+            "required": ["template_name"],
+        },
+    },
+    {
+        "name": "scheduler_create_template",
+        "description": "Create a custom job template for reusing job configurations.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Template name"},
+                "handler": {"type": "string", "description": "Default handler function"},
+                "description": {"type": "string", "description": "Template description"},
+                "category": {"type": "string", "description": "Template category", "enum": ["monitoring", "backup", "reporting", "maintenance", "notification", "data-pipeline", "custom"]},
+                "cron": {"type": "string", "description": "Default cron expression"},
+                "priority": {"type": "string", "enum": ["low", "normal", "high"]},
+                "timeout": {"type": "number", "description": "Default timeout in seconds"},
+                "max_retries": {"type": "integer", "description": "Default max retries"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Default tags"},
+                "required_fields": {"type": "array", "items": {"type": "string"}, "description": "Required field names"},
+                "payload": {"type": "object", "description": "Default payload values"},
+            },
+            "required": ["name", "handler"],
+        },
+    },
 ]
 
 
 class MCPServer:
     """MCP server implementation for agent-scheduler."""
 
-    def __init__(self, scheduler: Scheduler) -> None:
+    def __init__(self, scheduler: Scheduler, template_manager: Optional[TemplateManager] = None) -> None:
         self.scheduler = scheduler
+        self.template_manager = template_manager or TemplateManager(store=scheduler.store)
 
     def _resolve_job(self, job_identifier: str) -> Optional[Job]:
         """Resolve a job by ID or name."""
@@ -266,6 +378,11 @@ class MCPServer:
             tags=args.get("tags", []),
         )
         self.scheduler.add_job(job)
+
+        # Fire webhook
+        if self.scheduler.webhooks:
+            await self.scheduler.webhooks.fire_event(WebhookEvent.JOB_CREATED, job)
+
         return {"job": _job_to_dict(job), "message": f"Job '{job.name}' created"}
 
     async def _tool_scheduler_list_jobs(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -374,6 +491,115 @@ class MCPServer:
         deps = self.scheduler.get_dependencies(job.id)
         return {"dependencies": [d.model_dump(mode="json") for d in deps]}
 
+    # ── Webhook Tools ───────────────────────────────────────
+
+    async def _tool_scheduler_create_webhook(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.scheduler.webhooks is None:
+            return {"error": "Webhook support not enabled"}
+        events = [WebhookEvent(e) for e in args.get("events", [e.value for e in WebhookEvent])]
+        webhook = Webhook(
+            name=args["name"],
+            url=args["url"],
+            secret=args.get("secret"),
+            events=events,
+            tags=args.get("tags", []),
+            timeout=args.get("timeout", 10.0),
+            max_retries=args.get("max_retries", 3),
+        )
+        self.scheduler.webhooks.create_webhook(webhook)
+        return {"webhook": webhook.model_dump(mode="json"), "message": f"Webhook '{webhook.name}' created"}
+
+    async def _tool_scheduler_list_webhooks(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.scheduler.webhooks is None:
+            return {"error": "Webhook support not enabled"}
+        enabled_only = args.get("enabled_only", False)
+        webhooks = self.scheduler.webhooks.list_webhooks(enabled_only=enabled_only)
+        return {"webhooks": [w.model_dump(mode="json") for w in webhooks], "count": len(webhooks)}
+
+    async def _tool_scheduler_delete_webhook(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.scheduler.webhooks is None:
+            return {"error": "Webhook support not enabled"}
+        deleted = self.scheduler.webhooks.delete_webhook(args["webhook_id"])
+        if not deleted:
+            return {"error": f"Webhook not found: {args['webhook_id']}"}
+        return {"message": f"Webhook {args['webhook_id']} deleted"}
+
+    async def _tool_scheduler_get_webhook_deliveries(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.scheduler.webhooks is None:
+            return {"error": "Webhook support not enabled"}
+        webhook_id = args.get("webhook_id")
+        limit = args.get("limit", 50)
+        deliveries = self.scheduler.webhooks.get_deliveries(webhook_id=webhook_id, limit=limit)
+        return {
+            "deliveries": [d.model_dump(mode="json") for d in deliveries],
+            "count": len(deliveries),
+        }
+
+    # ── Template Tools ──────────────────────────────────────
+
+    async def _tool_scheduler_list_templates(self, args: dict[str, Any]) -> dict[str, Any]:
+        category = TemplateCategory(args["category"]) if args.get("category") else None
+        templates = self.template_manager.list_templates(category=category)
+        return {
+            "templates": [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "category": t.category.value,
+                    "handler": t.handler,
+                    "default_cron": t.default_cron,
+                    "default_priority": t.default_priority.value,
+                    "required_fields": t.required_fields,
+                }
+                for t in templates
+            ],
+            "count": len(templates),
+        }
+
+    async def _tool_scheduler_get_template(self, args: dict[str, Any]) -> dict[str, Any]:
+        template = self.template_manager.get_template_by_name(args["template_name"])
+        if template is None:
+            return {"error": f"Template not found: {args['template_name']}"}
+        return {"template": template.model_dump(mode="json")}
+
+    async def _tool_scheduler_instantiate_template(self, args: dict[str, Any]) -> dict[str, Any]:
+        overrides = {}
+        if args.get("name"):
+            overrides["name"] = args["name"]
+        if args.get("cron"):
+            overrides["cron"] = args["cron"]
+        if args.get("priority"):
+            overrides["priority"] = Priority(args["priority"])
+        if args.get("payload"):
+            overrides["payload"] = args["payload"]
+        if args.get("tags"):
+            overrides["tags"] = args["tags"]
+
+        try:
+            job = self.template_manager.instantiate(args["template_name"], **overrides)
+        except ValueError as e:
+            return {"error": str(e)}
+
+        self.scheduler.add_job(job)
+        return {"job": _job_to_dict(job), "message": f"Job '{job.name}' created from template '{args['template_name']}'"}
+
+    async def _tool_scheduler_create_template(self, args: dict[str, Any]) -> dict[str, Any]:
+        template = JobTemplate(
+            name=args["name"],
+            handler=args["handler"],
+            description=args.get("description", ""),
+            category=TemplateCategory(args.get("category", "custom")),
+            default_cron=args.get("cron"),
+            default_priority=Priority(args.get("priority", "normal")),
+            default_timeout=args.get("timeout", 300),
+            default_max_retries=args.get("max_retries", 0),
+            default_tags=args.get("tags", []),
+            required_fields=args.get("required_fields", []),
+            default_payload=args.get("payload", {}),
+        )
+        self.template_manager.create_template(template)
+        return {"template": template.model_dump(mode="json"), "message": f"Template '{template.name}' created"}
+
 
 async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> None:
     """Run the MCP server using stdio transport."""
@@ -381,7 +607,8 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
 
     store = JSONJobStore(data_dir=data_dir)
     scheduler = Scheduler(store=store)
-    server = MCPServer(scheduler)
+    template_manager = TemplateManager(store=store)
+    server = MCPServer(scheduler, template_manager)
 
     # Simple stdio-based MCP protocol
     reader = asyncio.StreamReader()
@@ -415,7 +642,7 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-scheduler", "version": "0.1.0"},
+                        "serverInfo": {"name": "agent-scheduler", "version": "0.2.0"},
                     },
                 }
             else:
