@@ -1,6 +1,6 @@
 # Agent Scheduler
 
-Task scheduling engine for autonomous agents — cron-like recurring jobs, one-time delayed tasks, priority queues, retry logic, webhooks, templates, MCP server, and REST API.
+Task scheduling engine for autonomous agents — cron-like recurring jobs, one-time delayed tasks, priority queues, retry logic, webhooks, templates, job groups, API key auth, SQLite backend, MCP server, and REST API.
 
 ## Features
 
@@ -30,11 +30,32 @@ Task scheduling engine for autonomous agents — cron-like recurring jobs, one-t
 - **Default overrides** — Pre-configured priority, retry, timeout, payload defaults
 - **Categories** — Organize templates by type (monitoring, backup, reporting, etc.)
 
+### SQLite Persistence (v0.3.0)
+- **Production backend** — SQLite with WAL mode for atomic transactions
+- **Efficient queries** — Indexed lookups by status, priority, next run, name
+- **Scalable** — Handles millions of records with proper pagination
+- **Better concurrency** — WAL mode allows concurrent reads during writes
+- **Drop-in replacement** — Same JobStore interface, just use `SQLiteJobStore`
+
+### API Key Authentication (v0.3.0)
+- **Bearer token auth** — `Authorization: Bearer ask_...` or `X-API-Key` header
+- **Scoped permissions** — 9 scopes (jobs:read/write, executions:read/write, webhooks:read/write, templates:read/write, admin, *)
+- **Rate limiting** — Configurable per-key request limits (default: 100/min)
+- **Key management** — Create, list, revoke, enable/disable keys via API or CLI
+- **Usage tracking** — Last used timestamp and request count per key
+
+### Job Groups (v0.3.0)
+- **Multi-tenant** — Organize jobs by agent, project, or team
+- **Quotas** — Per-group job limits and concurrent execution caps
+- **Bulk operations** — Pause/resume all jobs in a group
+- **Group stats** — Track job counts, execution stats, and quota usage per group
+- **Auto-tagging** — Jobs automatically tagged with group ID and group defaults
+
 ### Integration
-- **MCP server** — 20 tools for agent integration via Model Context Protocol
-- **REST API** — HTTP endpoints for remote integration (Starlette + raw ASGI fallback)
-- **CLI** — 20+ commands with Rich formatting
-- **JSON persistence** — Zero-config, survives restarts
+- **MCP server** — 25+ tools for agent integration via Model Context Protocol
+- **REST API** — 28+ HTTP endpoints for remote integration (Starlette + raw ASGI fallback)
+- **CLI** — 25+ commands with Rich formatting
+- **JSON or SQLite persistence** — Zero-config JSON or production-grade SQLite
 
 ## Quick Start
 

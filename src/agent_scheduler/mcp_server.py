@@ -19,6 +19,7 @@ from agent_scheduler.scheduler import Scheduler
 from agent_scheduler.store import JSONJobStore
 from agent_scheduler.webhook import Webhook, WebhookEvent, WebhookManager
 from agent_scheduler.templates import JobTemplate, TemplateCategory, TemplateManager
+from agent_scheduler.groups import GroupManager
 
 
 def _job_to_dict(job: Job) -> dict[str, Any]:
@@ -325,15 +326,75 @@ TOOLS = [
             "required": ["name", "handler"],
         },
     },
+    # ── Group Tools ────────────────────────────────────────
+    {
+        "name": "scheduler_create_group",
+        "description": "Create a job group for organizing related jobs (e.g., per agent, per project) with optional quotas.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Group name (must be unique)"},
+                "description": {"type": "string", "description": "Group description"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags applied to all jobs in group"},
+                "max_jobs": {"type": "integer", "description": "Maximum jobs allowed in group (null = unlimited)"},
+                "max_concurrent": {"type": "integer", "description": "Max concurrent executions"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "scheduler_list_groups",
+        "description": "List all job groups with optional filtering.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled_only": {"type": "boolean", "description": "Show only enabled groups", "default": False},
+            },
+        },
+    },
+    {
+        "name": "scheduler_get_group",
+        "description": "Get group details and statistics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_identifier": {"type": "string", "description": "Group ID or name"},
+            },
+            "required": ["group_identifier"],
+        },
+    },
+    {
+        "name": "scheduler_pause_group",
+        "description": "Pause all jobs in a group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_identifier": {"type": "string", "description": "Group ID or name"},
+            },
+            "required": ["group_identifier"],
+        },
+    },
+    {
+        "name": "scheduler_resume_group",
+        "description": "Resume all paused jobs in a group.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "group_identifier": {"type": "string", "description": "Group ID or name"},
+            },
+            "required": ["group_identifier"],
+        },
+    },
 ]
 
 
 class MCPServer:
     """MCP server implementation for agent-scheduler."""
 
-    def __init__(self, scheduler: Scheduler, template_manager: Optional[TemplateManager] = None) -> None:
+    def __init__(self, scheduler: Scheduler, template_manager: Optional[TemplateManager] = None, group_manager: Optional[GroupManager] = None) -> None:
         self.scheduler = scheduler
         self.template_manager = template_manager or TemplateManager(store=scheduler.store)
+        self.group_manager = group_manager or GroupManager(store=scheduler.store, scheduler=scheduler)
 
     def _resolve_job(self, job_identifier: str) -> Optional[Job]:
         """Resolve a job by ID or name."""
@@ -600,6 +661,54 @@ class MCPServer:
         self.template_manager.create_template(template)
         return {"template": template.model_dump(mode="json"), "message": f"Template '{template.name}' created"}
 
+    # ── Group Tools ────────────────────────────────────────
+
+    async def _tool_scheduler_create_group(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.groups import GroupQuota
+        quota = None
+        max_jobs = args.get("max_jobs")
+        max_concurrent = args.get("max_concurrent")
+        if max_jobs is not None or max_concurrent is not None:
+            quota = GroupQuota(max_jobs=max_jobs, max_concurrent=max_concurrent)
+        try:
+            group = self.group_manager.create_group(
+                name=args["name"],
+                description=args.get("description", ""),
+                tags=args.get("tags"),
+                quota=quota,
+            )
+            return {"group": group.model_dump(mode="json"), "message": f"Group '{group.name}' created"}
+        except ValueError as e:
+            return {"error": str(e)}
+
+    async def _tool_scheduler_list_groups(self, args: dict[str, Any]) -> dict[str, Any]:
+        groups = self.group_manager.list_groups(enabled_only=args.get("enabled_only", False))
+        return {"groups": [g.model_dump(mode="json") for g in groups], "count": len(groups)}
+
+    async def _tool_scheduler_get_group(self, args: dict[str, Any]) -> dict[str, Any]:
+        group = self.group_manager.get_group(args["group_identifier"])
+        if group is None:
+            return {"error": f"Group not found: {args['group_identifier']}"}
+        stats = self.group_manager.get_stats(args["group_identifier"])
+        result = {"group": group.model_dump(mode="json")}
+        if stats:
+            result["stats"] = stats.model_dump(mode="json")
+        return result
+
+    async def _tool_scheduler_pause_group(self, args: dict[str, Any]) -> dict[str, Any]:
+        group = self.group_manager.get_group(args["group_identifier"])
+        if group is None:
+            return {"error": f"Group not found: {args['group_identifier']}"}
+        count = self.group_manager.pause_group(args["group_identifier"])
+        return {"message": f"Paused {count} jobs in group '{group.name}'"}
+
+    async def _tool_scheduler_resume_group(self, args: dict[str, Any]) -> dict[str, Any]:
+        group = self.group_manager.get_group(args["group_identifier"])
+        if group is None:
+            return {"error": f"Group not found: {args['group_identifier']}"}
+        count = self.group_manager.resume_group(args["group_identifier"])
+        return {"message": f"Resumed {count} jobs in group '{group.name}'"}
+
 
 async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> None:
     """Run the MCP server using stdio transport."""
@@ -642,7 +751,7 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-scheduler", "version": "0.2.0"},
+                        "serverInfo": {"name": "agent-scheduler", "version": "0.3.0"},
                     },
                 }
             else:

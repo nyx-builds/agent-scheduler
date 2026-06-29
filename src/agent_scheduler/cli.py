@@ -829,19 +829,166 @@ def template_add(
 @cli.command("api")
 @click.option("--host", default="0.0.0.0", help="Bind host")
 @click.option("--port", default=8080, type=int, help="Bind port")
+@click.option("--sqlite", is_flag=True, help="Use SQLite backend")
+@click.option("--auth", is_flag=True, help="Enable API key authentication")
 @click.pass_context
-def api_server(ctx: click.Context, host: str, port: int) -> None:
+def api_server(ctx: click.Context, host: str, port: int, sqlite: bool, auth: bool) -> None:
     """Start the REST API server."""
     from agent_scheduler.api import run_api_server
 
     data_dir = ctx.obj["data_dir"]
+    backend = "SQLite" if sqlite or auth else "JSON"
     console.print(f"[green]Starting REST API server on {host}:{port}...[/green]")
+    console.print(f"[dim]Backend: {backend} | Auth: {'enabled' if auth else 'disabled'}[/dim]")
     console.print("[dim]Press Ctrl+C to stop.[/dim]")
 
     try:
-        asyncio.run(run_api_server(host=host, port=port, data_dir=data_dir))
+        asyncio.run(run_api_server(host=host, port=port, data_dir=data_dir, use_sqlite=sqlite, enable_auth=auth))
     except KeyboardInterrupt:
         console.print("\n[yellow]API server stopped.[/yellow]")
+
+
+# ── Group Commands ──────────────────────────────────────────────
+
+@cli.group("group")
+@click.pass_context
+def group_group(ctx: click.Context) -> None:
+    """Manage job groups for multi-agent scheduling."""
+    pass
+
+
+@group_group.command("create")
+@click.option("--name", required=True, help="Group name")
+@click.option("--description", default="", help="Group description")
+@click.option("--tags", default=None, help="Comma-separated default tags")
+@click.option("--max-jobs", default=None, type=int, help="Max jobs quota")
+@click.option("--max-concurrent", default=None, type=int, help="Max concurrent executions")
+@click.pass_context
+def group_create(ctx: click.Context, name: str, description: str, tags: Optional[str], max_jobs: Optional[int], max_concurrent: Optional[int]) -> None:
+    """Create a new job group."""
+    from agent_scheduler.groups import GroupManager, GroupQuota
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    quota = None
+    if max_jobs is not None or max_concurrent is not None:
+        quota = GroupQuota(max_jobs=max_jobs, max_concurrent=max_concurrent)
+
+    try:
+        group = manager.create_group(name=name, description=description, tags=tag_list, quota=quota)
+        console.print(Panel(
+            f"[green]Group created![/green]\n\n"
+            f"  ID: {group.id}\n"
+            f"  Name: {group.name}\n"
+            f"  Tags: {', '.join(group.tags) or 'None'}\n"
+            f"  Max Jobs: {group.quota.max_jobs or 'Unlimited'}",
+            title="Job Group",
+        ))
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+
+@group_group.command("list")
+@click.pass_context
+def group_list(ctx: click.Context) -> None:
+    """List all job groups."""
+    from agent_scheduler.groups import GroupManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+    groups = manager.list_groups()
+
+    if not groups:
+        console.print("[dim]No groups found.[/dim]")
+        return
+
+    table = Table(title="Job Groups", show_lines=True)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="white")
+    table.add_column("Description", style="dim")
+    table.add_column("Enabled", style="green")
+    table.add_column("Max Jobs", style="yellow")
+
+    for g in groups:
+        table.add_row(g.id, g.name, g.description or "—", "✓" if g.enabled else "✗", str(g.quota.max_jobs or "∞"))
+    console.print(table)
+
+
+@group_group.command("show")
+@click.argument("identifier")
+@click.pass_context
+def group_show(ctx: click.Context, identifier: str) -> None:
+    """Show group details and stats."""
+    from agent_scheduler.groups import GroupManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+    group = manager.get_group(identifier)
+    if group is None:
+        console.print(f"[red]Group not found: {identifier}[/red]")
+        sys.exit(1)
+
+    stats = manager.get_stats(identifier)
+    info = (
+        f"  [cyan]ID:[/cyan] {group.id}\n"
+        f"  [cyan]Name:[/cyan] {group.name}\n"
+        f"  [cyan]Description:[/cyan] {group.description or 'None'}\n"
+        f"  [cyan]Enabled:[/cyan] {group.enabled}\n"
+        f"  [cyan]Tags:[/cyan] {', '.join(group.tags) or 'None'}\n"
+        f"  [cyan]Max Jobs:[/cyan] {group.quota.max_jobs or 'Unlimited'}\n"
+    )
+    if stats:
+        info += (
+            f"\n  [green]Jobs:[/green] {stats.total_jobs} (active: {stats.active_jobs}, paused: {stats.paused_jobs})\n"
+            f"  [green]Executions:[/green] {stats.total_executions} (ok: {stats.successful_executions}, fail: {stats.failed_executions})\n"
+            f"  [yellow]Quota Usage:[/yellow] {stats.quota_usage_pct}%"
+        )
+    console.print(Panel(info, title=f"Group: {group.name}"))
+
+
+@group_group.command("pause")
+@click.argument("identifier")
+@click.pass_context
+def group_pause(ctx: click.Context, identifier: str) -> None:
+    """Pause all jobs in a group."""
+    from agent_scheduler.groups import GroupManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+    count = manager.pause_group(identifier)
+    console.print(f"[yellow]Paused {count} job(s) in group.[/yellow]")
+
+
+@group_group.command("resume")
+@click.argument("identifier")
+@click.pass_context
+def group_resume(ctx: click.Context, identifier: str) -> None:
+    """Resume all paused jobs in a group."""
+    from agent_scheduler.groups import GroupManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+    count = manager.resume_group(identifier)
+    console.print(f"[green]Resumed {count} job(s) in group.[/green]")
+
+
+@group_group.command("delete")
+@click.argument("identifier")
+@click.option("--force", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def group_delete(ctx: click.Context, identifier: str, force: bool) -> None:
+    """Delete a job group (keeps jobs)."""
+    from agent_scheduler.groups import GroupManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    manager = GroupManager(store=scheduler.store, scheduler=scheduler)
+
+    if not force:
+        if not click.confirm("Delete this group? (Jobs will be kept)"):
+            return
+
+    if manager.delete_group(identifier):
+        console.print("[red]Group deleted.[/red]")
+    else:
+        console.print(f"[red]Group not found: {identifier}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
