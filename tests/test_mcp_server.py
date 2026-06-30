@@ -330,5 +330,121 @@ class TestMCPServerTools:
 
     @pytest.mark.asyncio
     async def test_tool_count(self):
-        """Verify we have at least 20 tools (15 original + webhook + template)."""
-        assert len(TOOLS) >= 20
+        """Verify we have at least 25 tools (original + webhook + template + group + analytics + cron)."""
+        assert len(TOOLS) >= 25
+
+    # ── Analytics Tools (v0.4.0) ───────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_analytics_dashboard_empty(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_analytics_dashboard", {})
+        assert "dashboard" in result
+        assert result["dashboard"]["total_executions"] == 0
+
+    @pytest.mark.asyncio
+    async def test_analytics_dashboard_with_data(self, mcp_server):
+        # Create and run a job to generate execution history
+        await mcp_server.handle_tool_call("scheduler_create_job", {
+            "name": "test-job",
+            "handler": "test.handler",
+            "cron": "0 9 * * *",
+        })
+        await mcp_server.handle_tool_call("scheduler_run_job", {"job_identifier": "test-job"})
+
+        result = await mcp_server.handle_tool_call("scheduler_analytics_dashboard", {})
+        assert "dashboard" in result
+        assert result["dashboard"]["total_executions"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_job_health(self, mcp_server):
+        await mcp_server.handle_tool_call("scheduler_create_job", {
+            "name": "test-job",
+            "handler": "test.handler",
+            "cron": "0 9 * * *",
+        })
+        result = await mcp_server.handle_tool_call("scheduler_job_health", {
+            "job_identifier": "test-job",
+        })
+        assert "health_report" in result
+        assert result["health_report"]["job_name"] == "test-job"
+
+    @pytest.mark.asyncio
+    async def test_job_health_not_found(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_job_health", {
+            "job_identifier": "nonexistent",
+        })
+        assert "error" in result
+
+    # ── Cron Helper Tools (v0.4.0) ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_validate_cron_valid(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_validate_cron", {
+            "expression": "0 9 * * MON-FRI",
+        })
+        assert result["validation"]["is_valid"] is True
+
+    @pytest.mark.asyncio
+    async def test_validate_cron_invalid(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_validate_cron", {
+            "expression": "not valid",
+        })
+        assert result["validation"]["is_valid"] is False
+
+    @pytest.mark.asyncio
+    async def test_describe_cron(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_describe_cron", {
+            "expression": "*/15 * * * *",
+        })
+        assert "description" in result
+        assert "15" in result["description"]
+
+    @pytest.mark.asyncio
+    async def test_preview_cron(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_preview_cron", {
+            "expression": "0 9 * * *",
+            "count": 3,
+        })
+        assert result["count"] == 3
+        assert len(result["next_runs"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_preview_cron_invalid(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_preview_cron", {
+            "expression": "invalid",
+        })
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_build_cron_daily(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_build_cron", {
+            "frequency": "daily",
+            "hour": 9,
+            "minute": 30,
+        })
+        assert result["expression"] == "30 9 * * *"
+
+    @pytest.mark.asyncio
+    async def test_build_cron_every_n_minutes(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_build_cron", {
+            "frequency": "every-n-minutes",
+            "n": 15,
+        })
+        assert result["expression"] == "*/15 * * * *"
+
+    @pytest.mark.asyncio
+    async def test_build_cron_weekly(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_build_cron", {
+            "frequency": "weekly",
+            "day": "monday",
+            "hour": 9,
+        })
+        assert result["expression"] == "0 9 * * 0"
+
+    @pytest.mark.asyncio
+    async def test_build_cron_invalid(self, mcp_server):
+        result = await mcp_server.handle_tool_call("scheduler_build_cron", {
+            "frequency": "every-n-minutes",
+            "n": 0,
+        })
+        assert "error" in result

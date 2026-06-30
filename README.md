@@ -51,10 +51,34 @@ Task scheduling engine for autonomous agents — cron-like recurring jobs, one-t
 - **Group stats** — Track job counts, execution stats, and quota usage per group
 - **Auto-tagging** — Jobs automatically tagged with group ID and group defaults
 
+### Execution Analytics (v0.4.0)
+- **Health scoring** — Composite 0-100 score per job (success rate, trend, recency, failure trend)
+- **Letter grades** — A-F health grades for quick at-a-glance assessment
+- **Duration statistics** — Min, max, avg, median, p95, p99 percentiles
+- **Failure pattern analysis** — Groups and ranks common errors across jobs
+- **Scheduler dashboard** — Aggregate health, execution counts (24h/7d/all-time), top failures
+- **At-risk detection** — Automatically flags jobs with health score < 50
+- **Stale job detection** — Identifies scheduled jobs that haven't run in 24h+
+
+### Cron Expression Toolkit (v0.4.0)
+- **Validation** — Validate cron expressions with detailed error messages
+- **Human-readable descriptions** — Translate cron to English ("Every Monday at 9:00 AM")
+- **Run preview** — Show the next N scheduled run times
+- **Expression builder** — Construct cron from natural parameters (`daily`, `weekly`, `weekdays`, etc.)
+- **Field parser** — Extract field meanings from any cron expression
+
+### Notification Channels (v0.4.0)
+- **Slack** — Rich Block Kit messages via Incoming Webhooks
+- **Discord** — Formatted embeds with color-coded severity
+- **Email** — HTML + plain text via SMTP with TLS/SSL support
+- **Generic HTTP** — JSON POST to any endpoint with optional HMAC signing
+- **Channel manager** — Register multiple channels, filter by severity level
+- **Config factory** — Create channels from config dicts for easy setup
+
 ### Integration
-- **MCP server** — 25+ tools for agent integration via Model Context Protocol
+- **MCP server** — 29+ tools for agent integration via Model Context Protocol
 - **REST API** — 28+ HTTP endpoints for remote integration (Starlette + raw ASGI fallback)
-- **CLI** — 25+ commands with Rich formatting
+- **CLI** — 30+ commands with Rich formatting
 - **JSON or SQLite persistence** — Zero-config JSON or production-grade SQLite
 
 ## Quick Start
@@ -155,6 +179,38 @@ agent-scheduler template add \
   --required-fields "payload.pipeline_id"
 ```
 
+### Analytics & Health (v0.4.0)
+
+```bash
+# Show the full analytics dashboard
+agent-scheduler analytics
+
+# Health report for a specific job
+agent-scheduler health daily-report
+```
+
+### Cron Toolkit (v0.4.0)
+
+```bash
+# Validate a cron expression
+agent-scheduler cron validate "0 9 * * MON-FRI"
+
+# Describe a cron expression in plain English
+agent-scheduler cron describe "*/15 * * * *"
+# => Every 15 minutes
+
+# Preview the next 10 runs
+agent-scheduler cron preview "0 9 * * *" --count 10
+
+# Build a cron expression from parameters
+agent-scheduler cron build --frequency daily --hour 9 --minute 30
+# => 30 9 * * *
+agent-scheduler cron build --frequency weekly --day monday --hour 9
+# => 0 9 * * 0
+agent-scheduler cron build --frequency every-n-minutes --n 15
+# => */15 * * * *
+```
+
 ### REST API
 
 ```bash
@@ -194,7 +250,7 @@ agent-scheduler serve --port 8080
 | DELETE | `/api/v1/webhooks/{id}` | Delete webhook |
 | GET | `/api/v1/webhook-deliveries` | Delivery history |
 
-### MCP Tools (20 tools)
+### MCP Tools (29 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -221,6 +277,17 @@ agent-scheduler serve --port 8080
 | `scheduler_get_template` | Get template details |
 | `scheduler_instantiate_template` | Create job from template |
 | `scheduler_create_template` | Create custom template |
+| `scheduler_create_group` | Create a job group |
+| `scheduler_list_groups` | List job groups |
+| `scheduler_get_group` | Get group details |
+| `scheduler_pause_group` | Pause all jobs in group |
+| `scheduler_resume_group` | Resume all jobs in group |
+| `scheduler_analytics_dashboard` | Full analytics dashboard (v0.4.0) |
+| `scheduler_job_health` | Per-job health report (v0.4.0) |
+| `scheduler_validate_cron` | Validate cron expression (v0.4.0) |
+| `scheduler_describe_cron` | Describe cron in English (v0.4.0) |
+| `scheduler_preview_cron` | Preview upcoming runs (v0.4.0) |
+| `scheduler_build_cron` | Build cron from parameters (v0.4.0) |
 
 ## Built-in Templates
 
@@ -291,6 +358,84 @@ executions = asyncio.run(scheduler.run_due_jobs())
 # Get stats
 stats = scheduler.get_stats()
 print(f"Active: {stats.active_jobs}, Failed: {stats.failed_jobs}")
+```
+
+### Analytics API (v0.4.0)
+
+```python
+from agent_scheduler.analytics import AnalyticsEngine
+
+engine = AnalyticsEngine(scheduler=scheduler)
+
+# Full dashboard
+dashboard = engine.dashboard()
+print(f"Health: {dashboard.overall_health_grade} ({dashboard.overall_health_score}/100)")
+print(f"At-risk jobs: {dashboard.at_risk_jobs}")
+
+# Single job health
+job = scheduler.get_job_by_name("daily-report")
+report = engine.job_report(job)
+print(f"{report.job_name}: {report.health_grade} ({report.health_score}/100)")
+```
+
+### Cron Toolkit API (v0.4.0)
+
+```python
+from agent_scheduler.cron_helper import (
+    validate_cron, describe_cron, preview_runs, suggest_cron, CronBuilder
+)
+
+# Validate
+result = validate_cron("0 9 * * MON-FRI")
+assert result.is_valid
+
+# Describe
+print(describe_cron("*/15 * * * *"))  # => "Every 15 minutes"
+
+# Preview next runs
+runs = preview_runs("0 9 * * *", n=5)
+
+# Build from parameters
+expr = suggest_cron("daily", hour=9, minute=30)  # => "30 9 * * *"
+expr = suggest_cron("weekdays", hour=9)           # => "0 9 * * 0-4"
+```
+
+### Notification Channels API (v0.4.0)
+
+```python
+from agent_scheduler.notifications import (
+    Notification, NotificationLevel, ChannelManager,
+    SlackChannel, DiscordChannel, EmailChannel, HttpChannel,
+)
+
+# Set up channels
+mgr = ChannelManager()
+mgr.add_channel(SlackChannel(
+    webhook_url="https://hooks.slack.com/services/XXX",
+    name="ops-slack",
+))
+mgr.add_channel(DiscordChannel(
+    webhook_url="https://discord.com/api/webhooks/XXX",
+), levels=[NotificationLevel.ERROR])  # Only errors to Discord
+
+# Send a notification
+notif = Notification(
+    title="Job Failed",
+    message="daily-report failed after 3 retries",
+    level=NotificationLevel.ERROR,
+    job_name="daily-report",
+    event_type="job.failed",
+    metadata={"retry_count": 3},
+)
+results = asyncio.run(mgr.send(notif))
+
+# Or create from config dict
+from agent_scheduler.notifications import create_channel_from_config
+ch = create_channel_from_config({
+    "type": "slack",
+    "webhook_url": "https://hooks.slack.com/services/XXX",
+    "channel": "#alerts",
+})
 ```
 
 ## Handler Registration

@@ -6,7 +6,7 @@ import asyncio
 import json
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import click
 from rich.console import Console
@@ -988,6 +988,237 @@ def group_delete(ctx: click.Context, identifier: str, force: bool) -> None:
         console.print("[red]Group deleted.[/red]")
     else:
         console.print(f"[red]Group not found: {identifier}[/red]")
+        sys.exit(1)
+
+
+# ── Analytics Commands (v0.4.0) ──────────────────────────────
+
+
+@cli.command("analytics")
+@click.pass_context
+def analytics_dashboard(ctx: click.Context) -> None:
+    """Show execution analytics and health dashboard."""
+    from agent_scheduler.analytics import AnalyticsEngine
+
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    engine = AnalyticsEngine(scheduler=scheduler)
+    report = engine.dashboard()
+
+    # Overall health
+    health_color = {
+        "A": "bright_green", "B": "green", "C": "yellow",
+        "D": "red", "F": "bright_red",
+    }.get(report.overall_health_grade, "white")
+
+    console.print("\n[bold cyan]Scheduler Analytics Dashboard[/bold cyan]")
+    console.print(f"\nOverall Health: [{health_color}]{report.overall_health_grade}[/{health_color}] "
+                  f"({report.overall_health_score}/100)")
+    console.print(f"Success Rate: {report.overall_success_rate}%")
+    console.print(f"Total Executions: {report.total_executions}")
+
+    # Period table
+    period_table = Table(title="Execution Summary")
+    period_table.add_column("Period", style="cyan")
+    period_table.add_column("Total", justify="right")
+    period_table.add_column("Success", justify="right", style="green")
+    period_table.add_column("Failed", justify="right", style="red")
+    period_table.add_row("Last 24h", str(report.last_24h.get("total", 0)),
+                         str(report.last_24h.get("success", 0)),
+                         str(report.last_24h.get("failed", 0)))
+    period_table.add_row("Last 7d", str(report.last_7d.get("total", 0)),
+                         str(report.last_7d.get("success", 0)),
+                         str(report.last_7d.get("failed", 0)))
+    period_table.add_row("All Time", str(report.total_executions),
+                         str(report.successful_executions),
+                         str(report.failed_executions))
+    console.print(period_table)
+
+    # Duration stats
+    if report.duration_stats.count > 0:
+        ds = report.duration_stats
+        dur_table = Table(title="Duration Statistics")
+        dur_table.add_column("Metric", style="cyan")
+        dur_table.add_column("Value", justify="right")
+        dur_table.add_row("Count", str(ds.count))
+        dur_table.add_row("Average", f"{ds.avg_seconds:.4f}s")
+        dur_table.add_row("Median", f"{ds.median_seconds:.4f}s")
+        dur_table.add_row("P95", f"{ds.p95_seconds:.4f}s")
+        dur_table.add_row("P99", f"{ds.p99_seconds:.4f}s")
+        dur_table.add_row("Min", f"{ds.min_seconds:.4f}s")
+        dur_table.add_row("Max", f"{ds.max_seconds:.4f}s")
+        console.print(dur_table)
+
+    # Healthiest / unhealthiest
+    if report.unhealthiest_jobs:
+        uh_table = Table(title="Unhealthiest Jobs")
+        uh_table.add_column("Job", style="red")
+        uh_table.add_column("Health", justify="right")
+        uh_table.add_column("Grade", justify="center")
+        uh_table.add_column("Success Rate", justify="right")
+        uh_table.add_column("Executions", justify="right")
+        for r in report.unhealthiest_jobs:
+            uh_table.add_row(r.job_name, f"{r.health_score}", r.health_grade,
+                             f"{r.success_rate}%", str(r.total_executions))
+        console.print(uh_table)
+
+    if report.healthiest_jobs:
+        h_table = Table(title="Healthiest Jobs")
+        h_table.add_column("Job", style="green")
+        h_table.add_column("Health", justify="right")
+        h_table.add_column("Grade", justify="center")
+        h_table.add_column("Success Rate", justify="right")
+        h_table.add_column("Executions", justify="right")
+        for r in report.healthiest_jobs:
+            h_table.add_row(r.job_name, f"{r.health_score}", r.health_grade,
+                            f"{r.success_rate}%", str(r.total_executions))
+        console.print(h_table)
+
+    # Failure patterns
+    if report.top_failures:
+        f_table = Table(title="Top Failure Patterns")
+        f_table.add_column("#", justify="right", style="dim")
+        f_table.add_column("Error", style="red")
+        f_table.add_column("Count", justify="right")
+        f_table.add_column("Jobs Affected", justify="right")
+        for i, fp in enumerate(report.top_failures, 1):
+            f_table.add_row(str(i), fp.error[:80], str(fp.count), str(len(fp.affected_jobs)))
+        console.print(f_table)
+
+    # At-risk and stale
+    if report.at_risk_jobs:
+        console.print(f"\n[red]⚠ At-risk jobs (health < 50): {', '.join(report.at_risk_jobs)}[/red]")
+    if report.stale_jobs:
+        console.print(f"[yellow]⚠ Stale jobs (not running): {', '.join(report.stale_jobs)}[/yellow]")
+
+
+@cli.command("health")
+@click.argument("job_identifier")
+@click.pass_context
+def job_health(ctx: click.Context, job_identifier: str) -> None:
+    """Show health report for a specific job."""
+    from agent_scheduler.analytics import AnalyticsEngine
+
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    job = scheduler.get_job(job_identifier) or scheduler.get_job_by_name(job_identifier)
+    if not job:
+        console.print(f"[red]Job not found: {job_identifier}[/red]")
+        sys.exit(1)
+
+    engine = AnalyticsEngine(scheduler=scheduler)
+    report = engine.job_report(job)
+
+    health_color = {
+        "A": "bright_green", "B": "green", "C": "yellow",
+        "D": "red", "F": "bright_red",
+    }.get(report.health_grade, "white")
+
+    console.print(f"\n[bold cyan]Health Report: {job.name}[/bold cyan]\n")
+    console.print(f"Health Score: [{health_color}]{report.health_grade}[/{health_color}] "
+                  f"({report.health_score}/100)")
+    console.print(f"Status: {report.status.value}")
+    console.print(f"Total Executions: {report.total_executions}")
+    console.print(f"Success Rate: {report.success_rate}%")
+    console.print(f"Successful: {report.successful_executions} | Failed: {report.failed_executions} | Retries: {report.retry_count}")
+    if report.avg_duration_seconds is not None:
+        console.print(f"Avg Duration: {report.avg_duration_seconds:.4f}s")
+    if report.last_run_at:
+        console.print(f"Last Run: {report.last_run_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    if report.last_error:
+        console.print(f"[red]Last Error: {report.last_error}[/red]")
+    if report.last_5_statuses:
+        console.print(f"Last 5 Runs: {' → '.join(report.last_5_statuses)}")
+    if report.is_stale:
+        console.print("[yellow]⚠ This job appears stale (not running as expected)[/yellow]")
+
+
+# ── Cron Helper Commands (v0.4.0) ────────────────────────────
+
+
+@cli.group("cron")
+@click.pass_context
+def cron_group(ctx: click.Context) -> None:
+    """Cron expression utilities."""
+    pass
+
+
+@cron_group.command("validate")
+@click.argument("expression")
+def cron_validate(ctx: click.Context, expression: str) -> None:
+    """Validate a cron expression."""
+    from agent_scheduler.cron_helper import validate_cron
+    result = validate_cron(expression)
+    if result.is_valid:
+        console.print(f"[green]✓ Valid cron expression: {expression}[/green]")
+    else:
+        console.print(f"[red]✗ Invalid: {result.error}[/red]")
+        sys.exit(1)
+
+
+@cron_group.command("describe")
+@click.argument("expression")
+def cron_describe(ctx: click.Context, expression: str) -> None:
+    """Describe a cron expression in human-readable English."""
+    from agent_scheduler.cron_helper import describe_cron
+    description = describe_cron(expression)
+    console.print(f"[cyan]{expression}[/cyan] → {description}")
+
+
+@cron_group.command("preview")
+@click.argument("expression")
+@click.option("--count", default=5, type=int, help="Number of upcoming runs to show")
+def cron_preview(ctx: click.Context, expression: str, count: int) -> None:
+    """Preview the next N run times for a cron expression."""
+    from agent_scheduler.cron_helper import preview_runs, validate_cron
+
+    validation = validate_cron(expression)
+    if not validation.is_valid:
+        console.print(f"[red]Invalid cron: {validation.error}[/red]")
+        sys.exit(1)
+
+    runs = preview_runs(expression, n=count)
+    console.print(f"\n[bold]Next {count} runs for '{expression}':[/bold]\n")
+    for i, run_time in enumerate(runs, 1):
+        console.print(f"  {i}. {run_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+
+@cron_group.command("build")
+@click.option("--frequency",
+              type=click.Choice([
+                  "every-minute", "every-n-minutes", "hourly", "every-n-hours",
+                  "daily", "weekly", "weekdays", "weekends", "monthly",
+              ]),
+              required=True,
+              help="Schedule frequency")
+@click.option("--hour", default=0, type=int, help="Hour (0-23)")
+@click.option("--minute", default=0, type=int, help="Minute (0-59)")
+@click.option("--day", default=None, help="Day (day-of-week name or day-of-month number)")
+@click.option("--n", default=None, type=int, help="Interval N for every-N patterns")
+def cron_build(
+    ctx: click.Context,
+    frequency: str,
+    hour: int,
+    minute: int,
+    day: Optional[str],
+    n: Optional[int],
+) -> None:
+    """Build a cron expression from parameters."""
+    from agent_scheduler.cron_helper import suggest_cron
+
+    kwargs: dict[str, Any] = {"hour": hour, "minute": minute}
+    if day:
+        kwargs["day"] = day
+    if n:
+        kwargs["n"] = n
+
+    try:
+        expression = suggest_cron(frequency, **kwargs)
+        console.print(f"[green]{expression}[/green]")
+        # Also show description
+        from agent_scheduler.cron_helper import describe_cron
+        desc = describe_cron(expression)
+        console.print(f"[dim]({desc})[/dim]")
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
 

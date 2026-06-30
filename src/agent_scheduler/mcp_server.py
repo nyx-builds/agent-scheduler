@@ -385,6 +385,80 @@ TOOLS = [
             "required": ["group_identifier"],
         },
     },
+    # ── Analytics Tools (v0.4.0) ───────────────────────────
+    {
+        "name": "scheduler_analytics_dashboard",
+        "description": "Get a full analytics dashboard: overall health score, success rates, execution counts (24h/7d/all-time), duration stats (avg/median/p95/p99), healthiest/unhealthiest jobs, top failure patterns, at-risk and stale jobs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "scheduler_job_health",
+        "description": "Get a detailed health report for a specific job, including health score, grade, success rate, execution stats, last 5 statuses, and staleness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_identifier": {"type": "string", "description": "Job ID or name"},
+            },
+            "required": ["job_identifier"],
+        },
+    },
+    # ── Cron Helper Tools (v0.4.0) ─────────────────────────
+    {
+        "name": "scheduler_validate_cron",
+        "description": "Validate a cron expression and get a detailed error message if invalid.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Cron expression to validate"},
+            },
+            "required": ["expression"],
+        },
+    },
+    {
+        "name": "scheduler_describe_cron",
+        "description": "Convert a cron expression to a human-readable English description (e.g., '0 9 * * MON-FRI' → 'At 09:00 AM, Monday through Friday').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Cron expression to describe"},
+            },
+            "required": ["expression"],
+        },
+    },
+    {
+        "name": "scheduler_preview_cron",
+        "description": "Preview the next N run times for a cron expression.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "Cron expression"},
+                "count": {"type": "integer", "description": "Number of upcoming runs to show", "default": 5},
+            },
+            "required": ["expression"],
+        },
+    },
+    {
+        "name": "scheduler_build_cron",
+        "description": "Build a cron expression from natural parameters. Specify a frequency and optional time/day parameters.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "frequency": {
+                    "type": "string",
+                    "enum": ["every-minute", "every-n-minutes", "hourly", "every-n-hours", "daily", "weekly", "weekdays", "weekends", "monthly"],
+                    "description": "Schedule frequency",
+                },
+                "hour": {"type": "integer", "description": "Hour (0-23)", "default": 0},
+                "minute": {"type": "integer", "description": "Minute (0-59)", "default": 0},
+                "day": {"type": "string", "description": "Day of week name (for weekly) or day of month number (for monthly)"},
+                "n": {"type": "integer", "description": "Interval N for every-N patterns"},
+            },
+            "required": ["frequency"],
+        },
+    },
 ]
 
 
@@ -709,6 +783,73 @@ class MCPServer:
         count = self.group_manager.resume_group(args["group_identifier"])
         return {"message": f"Resumed {count} jobs in group '{group.name}'"}
 
+    # ── Analytics Tools (v0.4.0) ───────────────────────────
+
+    async def _tool_scheduler_analytics_dashboard(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.analytics import AnalyticsEngine
+
+        engine = AnalyticsEngine(scheduler=self.scheduler)
+        dashboard = engine.dashboard()
+        return {"dashboard": dashboard.model_dump(mode="json")}
+
+    async def _tool_scheduler_job_health(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.analytics import AnalyticsEngine
+
+        job = self._resolve_job(args["job_identifier"])
+        if job is None:
+            return {"error": f"Job not found: {args['job_identifier']}"}
+        engine = AnalyticsEngine(scheduler=self.scheduler)
+        report = engine.job_report(job)
+        return {"health_report": report.model_dump(mode="json")}
+
+    # ── Cron Helper Tools (v0.4.0) ─────────────────────────
+
+    async def _tool_scheduler_validate_cron(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.cron_helper import validate_cron
+
+        result = validate_cron(args["expression"])
+        return {"validation": result.model_dump()}
+
+    async def _tool_scheduler_describe_cron(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.cron_helper import describe_cron
+
+        description = describe_cron(args["expression"])
+        return {"expression": args["expression"], "description": description}
+
+    async def _tool_scheduler_preview_cron(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.cron_helper import preview_runs
+
+        try:
+            count = args.get("count", 5)
+            runs = preview_runs(args["expression"], n=count)
+            return {
+                "expression": args["expression"],
+                "next_runs": [r.isoformat() for r in runs],
+                "count": len(runs),
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+
+    async def _tool_scheduler_build_cron(self, args: dict[str, Any]) -> dict[str, Any]:
+        from agent_scheduler.cron_helper import suggest_cron, describe_cron
+
+        kwargs: dict[str, Any] = {}
+        if "hour" in args:
+            kwargs["hour"] = args["hour"]
+        if "minute" in args:
+            kwargs["minute"] = args["minute"]
+        if "day" in args:
+            kwargs["day"] = args["day"]
+        if "n" in args:
+            kwargs["n"] = args["n"]
+
+        try:
+            expression = suggest_cron(args["frequency"], **kwargs)
+            description = describe_cron(expression)
+            return {"expression": expression, "description": description}
+        except ValueError as e:
+            return {"error": str(e)}
+
 
 async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> None:
     """Run the MCP server using stdio transport."""
@@ -751,7 +892,7 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-scheduler", "version": "0.3.0"},
+                        "serverInfo": {"name": "agent-scheduler", "version": "0.4.0"},
                     },
                 }
             else:
