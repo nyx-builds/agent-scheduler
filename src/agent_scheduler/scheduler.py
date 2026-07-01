@@ -20,6 +20,8 @@ from agent_scheduler.models import (
 from agent_scheduler.handler import HandlerRegistry, get_default_registry
 from agent_scheduler.store import JobStore, JSONJobStore
 from agent_scheduler.webhook import WebhookEvent, WebhookManager
+from agent_scheduler.dlq import DeadLetterQueue, DLQReason
+from agent_scheduler.result_chain import ResultChainManager
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,8 @@ class Scheduler:
         webhook_manager: Optional[WebhookManager] = None,
         poll_interval: float = 1.0,
         max_concurrent: int = 10,
+        enable_dlq: bool = True,
+        enable_result_chaining: bool = True,
     ) -> None:
         self.store = store or JSONJobStore()
         self.handlers = handler_registry or get_default_registry()
@@ -63,6 +67,16 @@ class Scheduler:
         self._task: Optional[asyncio.Task] = None
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._active_jobs: dict[str, asyncio.Task] = {}
+
+        # v0.5.0: Dead Letter Queue for permanently failed jobs
+        self.dlq: Optional[DeadLetterQueue] = None
+        if enable_dlq:
+            self.dlq = DeadLetterQueue(scheduler=self)
+
+        # v0.5.0: Result chaining for job dependency pipelines
+        self.result_chains: Optional[ResultChainManager] = None
+        if enable_result_chaining:
+            self.result_chains = ResultChainManager(scheduler=self)
 
     # ── Job CRUD ──────────────────────────────────────────────
 
@@ -266,8 +280,8 @@ class Scheduler:
                 self.store.save_job(job)
                 self.store.save_execution(execution)
 
-                # Trigger dependent jobs
-                await self._trigger_dependents(job.id, execution.status)
+                # Trigger dependent jobs (pass result data for chaining)
+                await self._trigger_dependents(job.id, execution.status, execution.result)
 
                 # Fire webhook for job completion
                 if self.webhooks:
@@ -312,6 +326,30 @@ class Scheduler:
         job.next_run_at = job.compute_next_run()  # May still have future runs
         if job.is_recurring and job.next_run_at:
             job.status = JobStatus.SCHEDULED  # Recurring jobs stay scheduled
+
+        # v0.5.0: Move to Dead Letter Queue if this is a non-recurring job
+        # that has permanently failed (no future runs possible)
+        should_dead_letter = (
+            self.dlq is not None
+            and not (job.is_recurring and job.next_run_at is not None)
+        )
+        if should_dead_letter:
+            reason = (
+                DLQReason.TIMEOUT
+                if execution.status == ExecutionStatus.TIMEOUT
+                else DLQReason.MAX_RETRIES_EXHAUSTED
+            )
+            self.dlq.add(
+                job_id=job.id,
+                job_name=job.name,
+                handler=job.handler,
+                payload=job.payload,
+                reason=reason,
+                error_message=last_error or "Unknown error",
+                retry_attempts=max_attempts - 1,
+                original_job=job.model_dump(mode="json"),
+            )
+
         job.mark_updated()
         self.store.save_job(job)
         self.store.save_execution(execution)
@@ -343,13 +381,29 @@ class Scheduler:
                 return False
         return True
 
-    async def _trigger_dependents(self, job_id: str, status: ExecutionStatus) -> None:
-        """Trigger dependent jobs whose dependency conditions are met."""
+    async def _trigger_dependents(self, job_id: str, status: ExecutionStatus, result_data: Optional[dict[str, Any]] = None) -> None:
+        """Trigger dependent jobs whose dependency conditions are met.
+
+        v0.5.0: If result chaining is enabled and a link is configured,
+        the parent job's result data is merged into the dependent's payload.
+        """
         all_deps = self.store.list_dependencies()
         for dep in all_deps:
             if dep.depends_on_id == job_id and dep.on_status == status:
                 dependent_job = self.store.get_job(dep.job_id)
                 if dependent_job and dependent_job.enabled:
+                    # v0.5.0: Apply result chaining if configured
+                    if (
+                        self.result_chains is not None
+                        and result_data is not None
+                    ):
+                        dependent_job.payload = self.result_chains.process_result(
+                            parent_job_id=job_id,
+                            child_job_id=dependent_job.id,
+                            parent_result=result_data,
+                            child_payload=dependent_job.payload,
+                        )
+
                     # Schedule the dependent job to run immediately
                     dependent_job.next_run_at = datetime.now(timezone.utc)
                     self.store.save_job(dependent_job)

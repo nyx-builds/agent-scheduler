@@ -75,8 +75,27 @@ Task scheduling engine for autonomous agents — cron-like recurring jobs, one-t
 - **Channel manager** — Register multiple channels, filter by severity level
 - **Config factory** — Create channels from config dicts for easy setup
 
+### Dead Letter Queue (v0.5.0)
+- **Automatic dead-lettering** — Jobs that exhaust retries are moved to the DLQ instead of being silently lost
+- **Full context preserved** — Original payload, error message, retry count, and job snapshot stored for debugging
+- **Replay** — Resubmit dead-lettered jobs with optional payload overrides
+- **Discard** — Mark entries as resolved without replaying
+- **Bulk operations** — Replay all or discard all entries, optionally filtered by reason
+- **Statistics** — Track total/unresolved counts, breakdown by reason, oldest entry age
+- **Persistence** — DLQ entries survive restarts via JSON file storage
+- **CLI access** — Full CLI with `dlq list`, `dlq show`, `dlq replay`, `dlq discard`, `dlq stats`, `dlq purge`
+
+### Result Chaining & Pipelines (v0.5.0)
+- **Automatic result passing** — When Job A triggers Job B via dependency, A's result data flows into B's payload
+- **Merge strategies** — `merge` (parent wins), `child_first` (child wins), `replace` (parent replaces), `prefix` (prefixed keys)
+- **Selective key passing** — Pass only specific result keys from parent to child
+- **Key wrapping** — Nest parent result under a specific key in child payload
+- **Pipeline definitions** — Define named multi-step pipelines with per-step result configuration
+- **Pipeline tracking** — Start pipelines, record step results, track progress percentage
+- **CLI access** — `chain link`, `chain list`, `chain unlink`, `pipeline create`, `pipeline list`, `pipeline show`, `pipeline add-step`, `pipeline delete`
+
 ### Integration
-- **MCP server** — 29+ tools for agent integration via Model Context Protocol
+- **MCP server** — 43+ tools for agent integration via Model Context Protocol
 - **REST API** — 28+ HTTP endpoints for remote integration (Starlette + raw ASGI fallback)
 - **CLI** — 30+ commands with Rich formatting
 - **JSON or SQLite persistence** — Zero-config JSON or production-grade SQLite

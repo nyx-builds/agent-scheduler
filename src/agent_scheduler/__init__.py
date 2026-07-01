@@ -1,6 +1,6 @@
 """Agent Scheduler — Task scheduling engine for autonomous agents."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from agent_scheduler.models import (
     Job,
@@ -47,6 +47,20 @@ from agent_scheduler.notifications import (
     EmailChannel,
     HttpChannel,
     create_channel_from_config,
+)
+from agent_scheduler.dlq import (
+    DLQEntry,
+    DLQReason,
+    DLQStats,
+    DeadLetterQueue,
+)
+from agent_scheduler.result_chain import (
+    ChainStep,
+    Pipeline,
+    PipelineStatus,
+    ResultChainManager,
+    ResultConfig,
+    ResultMergeStrategy,
 )
 
 __all__ = [
@@ -106,4 +120,16 @@ __all__ = [
     "EmailChannel",
     "HttpChannel",
     "create_channel_from_config",
+    # DLQ
+    "DLQEntry",
+    "DLQReason",
+    "DLQStats",
+    "DeadLetterQueue",
+    # Result Chaining
+    "ChainStep",
+    "Pipeline",
+    "PipelineStatus",
+    "ResultChainManager",
+    "ResultConfig",
+    "ResultMergeStrategy",
 ]

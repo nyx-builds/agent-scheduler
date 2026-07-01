@@ -1222,5 +1222,427 @@ def cron_build(
         sys.exit(1)
 
 
+# ── DLQ Commands (v0.5.0) ─────────────────────────────────────
+
+
+@cli.group()
+@click.pass_context
+def dlq(ctx: click.Context) -> None:
+    """Dead Letter Queue management for failed jobs."""
+    pass
+
+
+@dlq.command(name="list")
+@click.option("--unresolved-only", is_flag=True, help="Show only unresolved entries")
+@click.option("--reason", type=click.Choice(["max_retries_exhausted", "timeout", "handler_not_found", "manual"]), default=None)
+@click.option("--limit", default=20, type=int, help="Max entries to show")
+@click.pass_context
+def dlq_list(ctx: click.Context, unresolved_only: bool, reason: Optional[str], limit: int) -> None:
+    """List dead-lettered jobs."""
+    from agent_scheduler.dlq import DLQReason
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    reason_enum = DLQReason(reason) if reason else None
+    entries = scheduler.dlq.list_entries(unresolved_only=unresolved_only, reason=reason_enum, limit=limit)
+
+    if not entries:
+        console.print("[dim]No dead-lettered jobs.[/dim]")
+        return
+
+    table = Table(title="Dead Letter Queue")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Job", style="white")
+    table.add_column("Reason", style="yellow")
+    table.add_column("Error", style="red")
+    table.add_column("Retries", justify="right")
+    table.add_column("Status")
+
+    for entry in entries:
+        error_short = (entry.error_message[:60] + "...") if len(entry.error_message) > 60 else entry.error_message
+        status_str = "[green]resolved[/green]" if entry.resolved else "[red]unresolved[/red]"
+        table.add_row(
+            entry.id,
+            entry.job_name,
+            entry.reason.value,
+            error_short,
+            str(entry.retry_attempts),
+            status_str,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {scheduler.dlq.count()} ({scheduler.dlq.count(unresolved_only=True)} unresolved)[/dim]")
+
+
+@dlq.command(name="show")
+@click.argument("entry_id")
+@click.pass_context
+def dlq_show(ctx: click.Context, entry_id: str) -> None:
+    """Show details of a specific DLQ entry."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    entry = scheduler.dlq.get(entry_id)
+    if entry is None:
+        console.print(f"[red]DLQ entry '{entry_id}' not found.[/red]")
+        sys.exit(1)
+
+    info_lines = [
+        f"[cyan]ID:[/cyan] {entry.id}",
+        f"[cyan]Job:[/cyan] {entry.job_name} ({entry.job_id})",
+        f"[cyan]Handler:[/cyan] {entry.handler}",
+        f"[cyan]Reason:[/cyan] [yellow]{entry.reason.value}[/yellow]",
+        f"[cyan]Error:[/cyan] [red]{entry.error_message}[/red]",
+        f"[cyan]Retry Attempts:[/cyan] {entry.retry_attempts}",
+        f"[cyan]Created:[/cyan] {entry.created_at}",
+        f"[cyan]Status:[/cyan] {'resolved' if entry.resolved else 'unresolved'}",
+    ]
+    if entry.resolution:
+        info_lines.append(f"[cyan]Resolution:[/cyan] {entry.resolution}")
+    if entry.payload:
+        info_lines.append(f"[cyan]Payload:[/cyan] {json.dumps(entry.payload, indent=2)}")
+
+    console.print(Panel("\n".join(info_lines), title=f"DLQ Entry — {entry.job_name}"))
+
+
+@dlq.command(name="replay")
+@click.argument("entry_id")
+@click.option("--payload", default=None, help="JSON payload override")
+@click.pass_context
+def dlq_replay(ctx: click.Context, entry_id: str, payload: Optional[str]) -> None:
+    """Replay a dead-lettered job."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    payload_override = None
+    if payload:
+        try:
+            payload_override = json.loads(payload)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON: {e}[/red]")
+            sys.exit(1)
+
+    job = scheduler.dlq.replay(entry_id, payload_override=payload_override)
+    if job is None:
+        console.print(f"[red]Entry '{entry_id}' not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Replayed job '{job.name}' (id={job.id}) — rescheduled for execution")
+
+
+@dlq.command(name="discard")
+@click.argument("entry_id")
+@click.pass_context
+def dlq_discard(ctx: click.Context, entry_id: str) -> None:
+    """Discard a DLQ entry (mark resolved without replaying)."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    if scheduler.dlq.discard(entry_id):
+        console.print(f"[green]✓[/green] Discarded DLQ entry '{entry_id}'")
+    else:
+        console.print(f"[red]Entry '{entry_id}' not found.[/red]")
+        sys.exit(1)
+
+
+@dlq.command(name="stats")
+@click.pass_context
+def dlq_stats(ctx: click.Context) -> None:
+    """Show DLQ statistics."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    stats = scheduler.dlq.get_stats()
+
+    table = Table(title="Dead Letter Queue — Statistics")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Total Entries", str(stats.total_entries))
+    table.add_row("Unresolved", str(stats.unresolved))
+    table.add_row("Resolved", str(stats.resolved))
+
+    if stats.by_reason:
+        for reason, count in sorted(stats.by_reason.items()):
+            table.add_row(f"  {reason}", str(count))
+
+    if stats.oldest_unresolved_age_seconds is not None:
+        table.add_row("Oldest Unresolved (s)", f"{stats.oldest_unresolved_age_seconds:.1f}")
+
+    console.print(table)
+
+
+@dlq.command(name="purge")
+@click.option("--all", "purge_all", is_flag=True, help="Purge ALL entries (including unresolved)")
+@click.pass_context
+def dlq_purge(ctx: click.Context, purge_all: bool) -> None:
+    """Remove resolved DLQ entries from storage."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.dlq is None:
+        console.print("[yellow]DLQ is not enabled.[/yellow]")
+        return
+
+    purged = scheduler.dlq.purge(resolved_only=not purge_all)
+    if purge_all:
+        console.print(f"[yellow]⚠[/yellow] Purged {purged} entries (ALL)")
+    else:
+        console.print(f"[green]✓[/green] Purged {purged} resolved entries")
+
+
+# ── Pipeline Commands (v0.5.0) ────────────────────────────────
+
+
+@cli.group()
+@click.pass_context
+def pipeline(ctx: click.Context) -> None:
+    """Pipeline management for multi-step job chains."""
+    pass
+
+
+@pipeline.command(name="create")
+@click.option("--name", required=True, help="Pipeline name")
+@click.option("--description", default="", help="Pipeline description")
+@click.pass_context
+def pipeline_create(ctx: click.Context, name: str, description: str) -> None:
+    """Create a new pipeline."""
+    from agent_scheduler.result_chain import ResultChainManager
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    p = scheduler.result_chains.create_pipeline(name=name, description=description)
+    console.print(f"[green]✓[/green] Created pipeline '{p.name}' (id={p.id})")
+
+
+@pipeline.command(name="list")
+@click.pass_context
+def pipeline_list(ctx: click.Context) -> None:
+    """List all pipelines."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    pipelines = scheduler.result_chains.list_pipelines()
+    if not pipelines:
+        console.print("[dim]No pipelines.[/dim]")
+        return
+
+    table = Table(title="Pipelines")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("Steps", justify="right")
+    table.add_column("Started")
+    table.add_column("Completed")
+
+    for p in pipelines:
+        started = "[green]yes[/green]" if p.started else "[dim]no[/dim]"
+        completed = "[green]yes[/green]" if p.completed else "[dim]no[/dim]"
+        table.add_row(p.id, p.name, str(p.step_count), started, completed)
+
+    console.print(table)
+
+
+@pipeline.command(name="show")
+@click.argument("pipeline_id")
+@click.pass_context
+def pipeline_show(ctx: click.Context, pipeline_id: str) -> None:
+    """Show pipeline details including steps and status."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    p = scheduler.result_chains.get_pipeline(pipeline_id) or scheduler.result_chains.get_pipeline_by_name(pipeline_id)
+    if p is None:
+        console.print(f"[red]Pipeline '{pipeline_id}' not found.[/red]")
+        sys.exit(1)
+
+    info = [
+        f"[cyan]ID:[/cyan] {p.id}",
+        f"[cyan]Name:[/cyan] {p.name}",
+        f"[cyan]Description:[/cyan] {p.description}",
+        f"[cyan]Steps:[/cyan] {p.step_count}",
+        f"[cyan]Started:[/cyan] {'yes' if p.started else 'no'}",
+        f"[cyan]Completed:[/cyan] {'yes' if p.completed else 'no'}",
+    ]
+    console.print(Panel("\n".join(info), title=f"Pipeline — {p.name}"))
+
+    if p.steps:
+        table = Table(title="Pipeline Steps")
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Step Name", style="white")
+        table.add_column("Job ID", style="cyan")
+        table.add_column("Chaining")
+
+        for step in p.steps:
+            chaining = "[green]yes[/green]" if step.result_config else "[dim]no[/dim]"
+            table.add_row(str(step.step_index), step.step_name, step.job_id, chaining)
+
+        console.print(table)
+
+    # Show status if started
+    status = scheduler.result_chains.get_pipeline_status(p.id)
+    if status:
+        console.print(f"\n[cyan]Progress:[/cyan] {status.progress_pct}% ({status.completed_steps}/{status.total_steps})")
+        if status.current_step:
+            console.print(f"[cyan]Current Step:[/cyan] {status.current_step}")
+
+
+@pipeline.command(name="add-step")
+@click.argument("pipeline_id")
+@click.option("--job-id", required=True, help="Job ID for this step")
+@click.option("--name", default="", help="Human-readable step name")
+@click.option("--merge", type=click.Choice(["merge", "child_first", "replace", "prefix"]), default="merge")
+@click.option("--keys", default=None, help="Comma-separated result keys to extract from parent")
+@click.pass_context
+def pipeline_add_step(
+    ctx: click.Context,
+    pipeline_id: str,
+    job_id: str,
+    name: str,
+    merge: str,
+    keys: Optional[str],
+) -> None:
+    """Add a step to a pipeline."""
+    from agent_scheduler.result_chain import ResultConfig, ResultMergeStrategy
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    config = None
+    if merge or keys:
+        result_keys = [k.strip() for k in keys.split(",")] if keys else None
+        config = ResultConfig(
+            merge_strategy=ResultMergeStrategy(merge),
+            result_keys=result_keys,
+        )
+
+    step = scheduler.result_chains.add_step(pipeline_id, job_id, name, config)
+    if step is None:
+        console.print(f"[red]Pipeline '{pipeline_id}' not found.[/red]")
+        sys.exit(1)
+
+    console.print(f"[green]✓[/green] Added step '{step.step_name}' (index={step.step_index}) to pipeline")
+
+
+@pipeline.command(name="delete")
+@click.argument("pipeline_id")
+@click.pass_context
+def pipeline_delete(ctx: click.Context, pipeline_id: str) -> None:
+    """Delete a pipeline."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    if scheduler.result_chains.delete_pipeline(pipeline_id):
+        console.print(f"[green]✓[/green] Deleted pipeline '{pipeline_id}'")
+    else:
+        console.print(f"[red]Pipeline '{pipeline_id}' not found.[/red]")
+        sys.exit(1)
+
+
+@cli.group()
+@click.pass_context
+def chain(ctx: click.Context) -> None:
+    """Configure result chaining between jobs."""
+    pass
+
+
+@chain.command(name="link")
+@click.option("--parent", required=True, help="Parent job ID")
+@click.option("--child", required=True, help="Child job ID")
+@click.option("--merge", type=click.Choice(["merge", "child_first", "replace", "prefix"]), default="merge")
+@click.option("--keys", default=None, help="Comma-separated result keys to pass from parent")
+@click.option("--prefix", default="parent_", help="Key prefix for 'prefix' strategy")
+@click.pass_context
+def chain_link(
+    ctx: click.Context,
+    parent: str,
+    child: str,
+    merge: str,
+    keys: Optional[str],
+    prefix: str,
+) -> None:
+    """Configure how a parent job's result flows into a child job."""
+    from agent_scheduler.result_chain import ResultConfig, ResultMergeStrategy
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    result_keys = [k.strip() for k in keys.split(",")] if keys else None
+    config = ResultConfig(
+        merge_strategy=ResultMergeStrategy(merge),
+        result_keys=result_keys,
+        key_prefix=prefix,
+    )
+    scheduler.result_chains.configure_link(parent, child, config)
+    console.print(f"[green]✓[/green] Linked {parent} → {child} (merge={merge})")
+
+
+@chain.command(name="list")
+@click.pass_context
+def chain_list(ctx: click.Context) -> None:
+    """List all result chain links."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    links = scheduler.result_chains.list_links()
+    if not links:
+        console.print("[dim]No chain links configured.[/dim]")
+        return
+
+    table = Table(title="Result Chain Links")
+    table.add_column("Parent", style="cyan")
+    table.add_column("Child", style="cyan")
+    table.add_column("Strategy", style="yellow")
+    table.add_column("Keys")
+
+    for link in links:
+        config = link["config"]
+        keys = ", ".join(config.get("result_keys", [])) if config.get("result_keys") else "[dim]all[/dim]"
+        table.add_row(
+            link["parent_job_id"],
+            link["child_job_id"],
+            config.get("merge_strategy", "merge"),
+            keys,
+        )
+
+    console.print(table)
+
+
+@chain.command(name="unlink")
+@click.option("--parent", required=True, help="Parent job ID")
+@click.option("--child", required=True, help="Child job ID")
+@click.pass_context
+def chain_unlink(ctx: click.Context, parent: str, child: str) -> None:
+    """Remove a result chain link."""
+    scheduler = get_scheduler(ctx.obj["data_dir"])
+    if scheduler.result_chains is None:
+        console.print("[yellow]Result chaining is not enabled.[/yellow]")
+        return
+
+    if scheduler.result_chains.remove_link(parent, child):
+        console.print(f"[green]✓[/green] Removed link {parent} → {child}")
+    else:
+        console.print(f"[red]Link not found.[/red]")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     cli()

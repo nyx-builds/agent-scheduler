@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-scheduler"
-version = "0.4.0"
+version = "0.5.0"
 description = "Task scheduling engine for autonomous agents — cron-like recurring jobs, one-time delayed tasks, priority queues, retry logic, webhooks, templates, job groups, API key auth, SQLite backend, REST API, MCP server"
 readme = "README.md"
 license = "MIT"

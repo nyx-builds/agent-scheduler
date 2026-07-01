@@ -459,6 +459,159 @@ TOOLS = [
             "required": ["frequency"],
         },
     },
+    # ── DLQ Tools (v0.5.0) ──────────────────────────────────
+    {
+        "name": "scheduler_dlq_list",
+        "description": "List dead-lettered jobs (permanently failed). Filter by unresolved status or reason.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "unresolved_only": {"type": "boolean", "description": "Show only unresolved entries", "default": False},
+                "reason": {"type": "string", "enum": ["max_retries_exhausted", "timeout", "handler_not_found", "manual"]},
+                "limit": {"type": "integer", "default": 100},
+            },
+        },
+    },
+    {
+        "name": "scheduler_dlq_show",
+        "description": "Show full details of a specific dead-letter queue entry, including original payload and error.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"entry_id": {"type": "string"}},
+            "required": ["entry_id"],
+        },
+    },
+    {
+        "name": "scheduler_dlq_replay",
+        "description": "Replay a dead-lettered job — resubmits it to the scheduler for execution. Optionally override payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": {"type": "string"},
+                "payload": {"type": "object", "description": "Payload overrides (merged with original)"},
+            },
+            "required": ["entry_id"],
+        },
+    },
+    {
+        "name": "scheduler_dlq_discard",
+        "description": "Discard a DLQ entry — mark as resolved without replaying.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"entry_id": {"type": "string"}},
+            "required": ["entry_id"],
+        },
+    },
+    {
+        "name": "scheduler_dlq_stats",
+        "description": "Get dead letter queue statistics — total, unresolved, by reason, oldest entry age.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scheduler_dlq_replay_all",
+        "description": "Replay all unresolved DLQ entries at once. Optionally filter by reason.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "enum": ["max_retries_exhausted", "timeout", "handler_not_found", "manual"]},
+            },
+        },
+    },
+    {
+        "name": "scheduler_dlq_purge",
+        "description": "Remove DLQ entries from storage. By default removes only resolved entries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "purge_all": {"type": "boolean", "description": "Purge ALL entries including unresolved", "default": False},
+            },
+        },
+    },
+    # ── Result Chain Tools (v0.5.0) ─────────────────────────
+    {
+        "name": "scheduler_chain_link",
+        "description": "Configure result chaining: parent job's execution result automatically flows into child job's payload when triggered via dependency.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "parent_job_id": {"type": "string"},
+                "child_job_id": {"type": "string"},
+                "merge_strategy": {"type": "string", "enum": ["merge", "child_first", "replace", "prefix"], "default": "merge"},
+                "result_keys": {"type": "array", "items": {"type": "string"}, "description": "Specific keys to pass from parent result (default: all)"},
+                "key_prefix": {"type": "string", "default": "parent_", "description": "Prefix for 'prefix' strategy"},
+                "wrap_key": {"type": "string", "description": "Nest parent result under this key"},
+            },
+            "required": ["parent_job_id", "child_job_id"],
+        },
+    },
+    {
+        "name": "scheduler_chain_unlink",
+        "description": "Remove a result chain link between two jobs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "parent_job_id": {"type": "string"},
+                "child_job_id": {"type": "string"},
+            },
+            "required": ["parent_job_id", "child_job_id"],
+        },
+    },
+    {
+        "name": "scheduler_chain_list",
+        "description": "List all configured result chain links.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    # ── Pipeline Tools (v0.5.0) ─────────────────────────────
+    {
+        "name": "scheduler_pipeline_create",
+        "description": "Create a named pipeline for tracking a multi-step job chain.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "scheduler_pipeline_list",
+        "description": "List all pipelines.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scheduler_pipeline_show",
+        "description": "Show pipeline details including steps and execution status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"pipeline_id": {"type": "string", "description": "Pipeline ID or name"}},
+            "required": ["pipeline_id"],
+        },
+    },
+    {
+        "name": "scheduler_pipeline_add_step",
+        "description": "Add a step to an existing pipeline. Optionally configure how the previous step's result flows into this step.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pipeline_id": {"type": "string"},
+                "job_id": {"type": "string"},
+                "step_name": {"type": "string"},
+                "merge_strategy": {"type": "string", "enum": ["merge", "child_first", "replace", "prefix"]},
+                "result_keys": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["pipeline_id", "job_id"],
+        },
+    },
+    {
+        "name": "scheduler_pipeline_delete",
+        "description": "Delete a pipeline (does not delete its jobs).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"pipeline_id": {"type": "string"}},
+            "required": ["pipeline_id"],
+        },
+    },
 ]
 
 
@@ -851,6 +1004,177 @@ class MCPServer:
             return {"error": str(e)}
 
 
+    # ── DLQ Tools (v0.5.0) ──────────────────────────────────
+
+    async def _tool_scheduler_dlq_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """List dead-lettered jobs."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        from agent_scheduler.dlq import DLQReason
+        reason = DLQReason(args["reason"]) if args.get("reason") else None
+        entries = self.scheduler.dlq.list_entries(
+            unresolved_only=args.get("unresolved_only", False),
+            reason=reason,
+            limit=args.get("limit", 100),
+        )
+        return {
+            "entries": [e.model_dump(mode="json") for e in entries],
+            "count": len(entries),
+            "total": self.scheduler.dlq.count(),
+            "unresolved": self.scheduler.dlq.count(unresolved_only=True),
+        }
+
+    async def _tool_scheduler_dlq_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Show details of a specific DLQ entry."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        entry = self.scheduler.dlq.get(args["entry_id"])
+        if entry is None:
+            return {"error": f"DLQ entry not found: {args['entry_id']}"}
+        return {"entry": entry.model_dump(mode="json")}
+
+    async def _tool_scheduler_dlq_replay(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Replay a dead-lettered job."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        job = self.scheduler.dlq.replay(
+            args["entry_id"],
+            payload_override=args.get("payload"),
+        )
+        if job is None:
+            return {"error": f"DLQ entry not found: {args['entry_id']}"}
+        return {"job": _job_to_dict(job), "message": f"Job '{job.name}' replayed"}
+
+    async def _tool_scheduler_dlq_discard(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Discard a DLQ entry."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        if self.scheduler.dlq.discard(args["entry_id"]):
+            return {"message": f"DLQ entry '{args['entry_id']}' discarded"}
+        return {"error": f"DLQ entry not found: {args['entry_id']}"}
+
+    async def _tool_scheduler_dlq_stats(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Get DLQ statistics."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        stats = self.scheduler.dlq.get_stats()
+        return {"stats": stats.model_dump(mode="json")}
+
+    async def _tool_scheduler_dlq_replay_all(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Replay all unresolved DLQ entries."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        from agent_scheduler.dlq import DLQReason
+        reason = DLQReason(args["reason"]) if args.get("reason") else None
+        count = self.scheduler.dlq.replay_all(reason=reason)
+        return {"message": f"Replayed {count} entries", "count": count}
+
+    async def _tool_scheduler_dlq_purge(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Purge resolved (or all) DLQ entries."""
+        if self.scheduler.dlq is None:
+            return {"error": "DLQ is not enabled"}
+        purged = self.scheduler.dlq.purge(resolved_only=not args.get("purge_all", False))
+        return {"message": f"Purged {purged} entries", "count": purged}
+
+    # ── Result Chain Tools (v0.5.0) ─────────────────────────
+
+    async def _tool_scheduler_chain_link(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Configure result chaining between two jobs."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        from agent_scheduler.result_chain import ResultConfig, ResultMergeStrategy
+        config = ResultConfig(
+            merge_strategy=ResultMergeStrategy(args.get("merge_strategy", "merge")),
+            result_keys=args.get("result_keys"),
+            key_prefix=args.get("key_prefix", "parent_"),
+            wrap_key=args.get("wrap_key"),
+        )
+        self.scheduler.result_chains.configure_link(
+            args["parent_job_id"],
+            args["child_job_id"],
+            config,
+        )
+        return {"message": f"Linked {args['parent_job_id']} → {args['child_job_id']}"}
+
+    async def _tool_scheduler_chain_unlink(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Remove a result chain link."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        if self.scheduler.result_chains.remove_link(args["parent_job_id"], args["child_job_id"]):
+            return {"message": f"Removed link {args['parent_job_id']} → {args['child_job_id']}"}
+        return {"error": "Link not found"}
+
+    async def _tool_scheduler_chain_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """List all result chain links."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        links = self.scheduler.result_chains.list_links()
+        return {"links": links, "count": len(links)}
+
+    # ── Pipeline Tools (v0.5.0) ─────────────────────────────
+
+    async def _tool_scheduler_pipeline_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Create a new pipeline."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        p = self.scheduler.result_chains.create_pipeline(
+            name=args["name"],
+            description=args.get("description", ""),
+        )
+        return {"pipeline": p.model_dump(mode="json"), "message": f"Pipeline '{p.name}' created"}
+
+    async def _tool_scheduler_pipeline_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """List all pipelines."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        pipelines = self.scheduler.result_chains.list_pipelines()
+        return {"pipelines": [p.model_dump(mode="json") for p in pipelines], "count": len(pipelines)}
+
+    async def _tool_scheduler_pipeline_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Show pipeline details."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        p = self.scheduler.result_chains.get_pipeline(args["pipeline_id"])
+        if p is None:
+            p = self.scheduler.result_chains.get_pipeline_by_name(args["pipeline_id"])
+        if p is None:
+            return {"error": f"Pipeline not found: {args['pipeline_id']}"}
+        result = {"pipeline": p.model_dump(mode="json")}
+        status = self.scheduler.result_chains.get_pipeline_status(p.id)
+        if status:
+            result["status"] = status.model_dump(mode="json")
+        return result
+
+    async def _tool_scheduler_pipeline_add_step(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Add a step to a pipeline."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        from agent_scheduler.result_chain import ResultConfig, ResultMergeStrategy
+        config = None
+        if args.get("merge_strategy") or args.get("result_keys"):
+            config = ResultConfig(
+                merge_strategy=ResultMergeStrategy(args.get("merge_strategy", "merge")),
+                result_keys=args.get("result_keys"),
+            )
+        step = self.scheduler.result_chains.add_step(
+            args["pipeline_id"],
+            args["job_id"],
+            args.get("step_name", ""),
+            config,
+        )
+        if step is None:
+            return {"error": f"Pipeline not found: {args['pipeline_id']}"}
+        return {"step": step.model_dump(mode="json"), "message": f"Step '{step.step_name}' added"}
+
+    async def _tool_scheduler_pipeline_delete(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Delete a pipeline."""
+        if self.scheduler.result_chains is None:
+            return {"error": "Result chaining is not enabled"}
+        if self.scheduler.result_chains.delete_pipeline(args["pipeline_id"]):
+            return {"message": f"Pipeline '{args['pipeline_id']}' deleted"}
+        return {"error": f"Pipeline not found: {args['pipeline_id']}"}
+
+
 async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> None:
     """Run the MCP server using stdio transport."""
     import sys
@@ -892,7 +1216,7 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-scheduler", "version": "0.4.0"},
+                        "serverInfo": {"name": "agent-scheduler", "version": "0.5.0"},
                     },
                 }
             else:
