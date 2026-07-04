@@ -612,6 +612,100 @@ TOOLS = [
             "required": ["pipeline_id"],
         },
     },
+    # ── v0.6.0: Circuit Breaker ──────────────────────────────
+    {
+        "name": "scheduler_circuit_breaker_list",
+        "description": "List all circuit breakers and their current states (closed, open, half_open).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scheduler_circuit_breaker_get",
+        "description": "Get the status of a specific handler's circuit breaker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"handler": {"type": "string", "description": "Handler name"}},
+            "required": ["handler"],
+        },
+    },
+    {
+        "name": "scheduler_circuit_breaker_reset",
+        "description": "Manually reset a circuit breaker to CLOSED state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"handler": {"type": "string", "description": "Handler name"}},
+            "required": ["handler"],
+        },
+    },
+    {
+        "name": "scheduler_circuit_breaker_reset_all",
+        "description": "Reset all circuit breakers to CLOSED state.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "scheduler_circuit_breaker_configure",
+        "description": "Configure circuit breaker settings for a handler.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handler": {"type": "string", "description": "Handler name"},
+                "failure_threshold": {"type": "integer", "description": "Consecutive failures before tripping", "default": 5},
+                "cooldown_seconds": {"type": "number", "description": "Seconds to stay open", "default": 60},
+                "success_threshold": {"type": "integer", "description": "Successes needed to close from half-open", "default": 2},
+            },
+            "required": ["handler"],
+        },
+    },
+    # ── v0.6.0: Time Window ──────────────────────────────────
+    {
+        "name": "scheduler_time_window_check",
+        "description": "Check whether a given time (or now) falls within a specified time window.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_time": {"type": "string", "description": "HH:MM start (default 00:00)"},
+                "end_time": {"type": "string", "description": "HH:MM end (default 23:59)"},
+                "days_of_week": {"type": "array", "items": {"type": "integer"}, "description": "0=Mon..6=Sun"},
+                "timezone": {"type": "string", "description": "IANA timezone", "default": "UTC"},
+                "check_time": {"type": "string", "description": "ISO datetime to check (default: now)"},
+            },
+        },
+    },
+    {
+        "name": "scheduler_time_window_next_start",
+        "description": "Get the next time a time window opens.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start_time": {"type": "string", "description": "HH:MM start (default 00:00)"},
+                "end_time": {"type": "string", "description": "HH:MM end (default 23:59)"},
+                "days_of_week": {"type": "array", "items": {"type": "integer"}, "description": "0=Mon..6=Sun"},
+                "timezone": {"type": "string", "description": "IANA timezone", "default": "UTC"},
+                "from_time": {"type": "string", "description": "ISO datetime to search from (default: now)"},
+            },
+        },
+    },
+    # ── v0.6.0: Conditional Execution ────────────────────────
+    {
+        "name": "scheduler_condition_test",
+        "description": "Test an execution condition against a job's current state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_identifier": {"type": "string", "description": "Job ID or name"},
+                "condition": {"type": "object", "description": "Condition to evaluate (must have 'type': rule|and|or|not)"},
+            },
+            "required": ["job_identifier", "condition"],
+        },
+    },
+    {
+        "name": "scheduler_condition_skip_count",
+        "description": "Get how many times a job was skipped due to its execution_condition.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"job_identifier": {"type": "string", "description": "Job ID or name"}},
+            "required": ["job_identifier"],
+        },
+    },
 ]
 
 
@@ -1174,6 +1268,139 @@ class MCPServer:
             return {"message": f"Pipeline '{args['pipeline_id']}' deleted"}
         return {"error": f"Pipeline not found: {args['pipeline_id']}"}
 
+    # ── v0.6.0: Circuit Breaker Tools ────────────────────────
+
+    async def _tool_scheduler_circuit_breaker_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """List all circuit breakers."""
+        breakers = self.scheduler.get_circuit_breaker_status()
+        return {"breakers": breakers, "count": len(breakers)}
+
+    async def _tool_scheduler_circuit_breaker_get(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Get a specific circuit breaker."""
+        result = self.scheduler.get_circuit_breaker(args["handler"])
+        if result is None:
+            return {"error": f"No circuit breaker for handler '{args['handler']}'"}
+        return {"breaker": result}
+
+    async def _tool_scheduler_circuit_breaker_reset(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Reset a circuit breaker."""
+        if self.scheduler.reset_circuit_breaker(args["handler"]):
+            return {"message": f"Circuit breaker for '{args['handler']}' reset to CLOSED"}
+        return {"error": f"No circuit breaker for handler '{args['handler']}'"}
+
+    async def _tool_scheduler_circuit_breaker_reset_all(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Reset all circuit breakers."""
+        count = self.scheduler.reset_all_circuit_breakers()
+        return {"message": f"Reset {count} circuit breaker(s)", "reset_count": count}
+
+    async def _tool_scheduler_circuit_breaker_configure(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Configure a circuit breaker."""
+        from agent_scheduler.circuit_breaker import CircuitConfig
+
+        config = CircuitConfig(
+            failure_threshold=args.get("failure_threshold", 5),
+            cooldown_seconds=args.get("cooldown_seconds", 60),
+            success_threshold=args.get("success_threshold", 2),
+        )
+        self.scheduler.configure_circuit_breaker(args["handler"], config)
+        return {
+            "message": f"Circuit breaker configured for '{args['handler']}'",
+            "config": config.model_dump(),
+        }
+
+    # ── v0.6.0: Time Window Tools ────────────────────────────
+
+    async def _tool_scheduler_time_window_check(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Check if a time is within a window."""
+        from agent_scheduler.time_window import TimeWindow
+
+        tw = TimeWindow(
+            start_time=args.get("start_time", "00:00"),
+            end_time=args.get("end_time", "23:59"),
+            days_of_week=args.get("days_of_week", list(range(7))),
+            timezone=args.get("timezone", "UTC"),
+        )
+
+        check_dt = None
+        if args.get("check_time"):
+            check_dt = datetime.fromisoformat(args["check_time"])
+
+        within = tw.is_within_window(check_dt)
+        return {
+            "within_window": within,
+            "window": tw.model_dump(),
+            "checked_at": (check_dt or datetime.now(timezone.utc)).isoformat(),
+        }
+
+    async def _tool_scheduler_time_window_next_start(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Get the next window opening."""
+        from agent_scheduler.time_window import TimeWindow
+
+        tw = TimeWindow(
+            start_time=args.get("start_time", "00:00"),
+            end_time=args.get("end_time", "23:59"),
+            days_of_week=args.get("days_of_week", list(range(7))),
+            timezone=args.get("timezone", "UTC"),
+        )
+
+        from_dt = None
+        if args.get("from_time"):
+            from_dt = datetime.fromisoformat(args["from_time"])
+
+        next_start = tw.next_window_start(from_dt)
+        return {
+            "next_window_start": next_start.isoformat(),
+            "window": tw.model_dump(),
+        }
+
+    # ── v0.6.0: Conditional Execution Tools ──────────────────
+
+    async def _tool_scheduler_condition_test(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Test a condition against a job's current state."""
+        from agent_scheduler.conditions import ConditionContext, evaluate_condition
+
+        job = self._resolve_job(args["job_identifier"])
+        if job is None:
+            return {"error": f"Job not found: {args['job_identifier']}"}
+
+        # Build context from job state
+        last_result = None
+        last_status = None
+        history = self.scheduler.store.get_executions(job.id, limit=1)
+        if history:
+            last = history[0]
+            last_result = last.result
+            last_status = last.status.value
+
+        context = ConditionContext(
+            payload=job.payload,
+            last_result=last_result,
+            last_status=last_status,
+            job_tags=job.tags,
+            job_metadata=job.metadata,
+            run_count=job.run_count,
+            fail_count=job.fail_count,
+        )
+
+        try:
+            result = evaluate_condition(args["condition"], context)
+            return {
+                "satisfied": result,
+                "would_execute": result,
+                "job_id": job.id,
+                "job_name": job.name,
+            }
+        except Exception as e:
+            return {"error": f"Condition evaluation failed: {e}"}
+
+    async def _tool_scheduler_condition_skip_count(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Get the skip count for a job's execution condition."""
+        job = self._resolve_job(args["job_identifier"])
+        if job is None:
+            return {"error": f"Job not found: {args['job_identifier']}"}
+        count = self.scheduler.get_condition_skip_count(job.id)
+        return {"job_id": job.id, "job_name": job.name, "skip_count": count}
+
 
 async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> None:
     """Run the MCP server using stdio transport."""
@@ -1216,7 +1443,7 @@ async def run_mcp_server(data_dir: Optional[str] = None, port: int = 8080) -> No
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-scheduler", "version": "0.5.0"},
+                        "serverInfo": {"name": "agent-scheduler", "version": "0.6.0"},
                     },
                 }
             else:

@@ -87,6 +87,17 @@ class Job(BaseModel):
     timeout: float = Field(default=300, ge=0, description="Run timeout in seconds")
     max_runs: Optional[int] = Field(default=None, ge=1, description="Maximum number of executions")
 
+    # v0.6.0: Execution constraints
+    time_window: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Time window constraints (start_time, end_time, days_of_week, timezone)",
+    )
+    execution_condition: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Conditional execution rule (evaluated before each run). "
+        "Must have 'type' key: 'rule', 'and', 'or', 'not'.",
+    )
+
     # State
     enabled: bool = Field(default=True, description="Whether job is active")
     status: JobStatus = Field(default=JobStatus.SCHEDULED, description="Current job status")
@@ -138,30 +149,48 @@ class Job(BaseModel):
         return self.cron is None and self.delay is None and self.run_at is None
 
     def compute_next_run(self, now: Optional[datetime] = None) -> Optional[datetime]:
-        """Compute the next run time for this job."""
+        """Compute the next run time for this job.
+
+        v0.6.0: If a time_window is configured and the computed run time
+        falls outside the window, the job is rescheduled to the next
+        moment the window opens.
+        """
         if not self.enabled or self.status == JobStatus.PAUSED:
             return None
 
         if now is None:
             now = datetime.now(timezone.utc)
 
+        next_run: Optional[datetime] = None
+
         if self.cron:
             from croniter import croniter
 
             cron = croniter(self.cron, now)
-            return cron.get_next(datetime)
+            next_run = cron.get_next(datetime)
 
-        if self.run_at:
+        elif self.run_at:
             if self.run_at > now:
-                return self.run_at
-            return None  # Past due one-time
+                next_run = self.run_at
+            else:
+                next_run = None  # Past due one-time
 
-        if self.delay is not None:
+        elif self.delay is not None:
             from datetime import timedelta
 
-            return now + timedelta(seconds=self.delay)
+            next_run = now + timedelta(seconds=self.delay)
+        else:
+            next_run = now  # Immediate job
 
-        return now  # Immediate job
+        # v0.6.0: Apply time window constraint
+        if next_run is not None and self.time_window:
+            from agent_scheduler.time_window import TimeWindow
+
+            tw = TimeWindow(**self.time_window)
+            if not tw.is_within_window(next_run):
+                next_run = tw.next_window_start(next_run)
+
+        return next_run
 
     def mark_updated(self) -> None:
         self.updated_at = datetime.now(timezone.utc)

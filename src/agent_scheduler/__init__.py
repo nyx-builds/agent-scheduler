@@ -1,6 +1,6 @@
 """Agent Scheduler — Task scheduling engine for autonomous agents."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from agent_scheduler.models import (
     Job,
@@ -61,6 +61,27 @@ from agent_scheduler.result_chain import (
     ResultChainManager,
     ResultConfig,
     ResultMergeStrategy,
+)
+from agent_scheduler.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerRegistry,
+    CircuitConfig,
+    CircuitState,
+)
+from agent_scheduler.conditions import (
+    AndCondition,
+    ConditionContext,
+    ConditionEvaluationError,
+    ConditionOperator,
+    ConditionRule,
+    evaluate_condition,
+    NotCondition,
+    OrCondition,
+)
+from agent_scheduler.time_window import (
+    TimeWindow,
+    is_within_window,
+    next_window_start,
 )
 
 __all__ = [
@@ -132,4 +153,22 @@ __all__ = [
     "ResultChainManager",
     "ResultConfig",
     "ResultMergeStrategy",
+    # Circuit Breaker (v0.6.0)
+    "CircuitBreaker",
+    "CircuitBreakerRegistry",
+    "CircuitConfig",
+    "CircuitState",
+    # Conditional Execution (v0.6.0)
+    "AndCondition",
+    "ConditionContext",
+    "ConditionEvaluationError",
+    "ConditionOperator",
+    "ConditionRule",
+    "evaluate_condition",
+    "NotCondition",
+    "OrCondition",
+    # Time Window (v0.6.0)
+    "TimeWindow",
+    "is_within_window",
+    "next_window_start",
 ]

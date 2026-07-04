@@ -22,6 +22,11 @@ from agent_scheduler.store import JobStore, JSONJobStore
 from agent_scheduler.webhook import WebhookEvent, WebhookManager
 from agent_scheduler.dlq import DeadLetterQueue, DLQReason
 from agent_scheduler.result_chain import ResultChainManager
+from agent_scheduler.circuit_breaker import (
+    CircuitBreakerRegistry,
+    CircuitConfig,
+    CircuitState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,7 @@ class Scheduler:
         max_concurrent: int = 10,
         enable_dlq: bool = True,
         enable_result_chaining: bool = True,
+        enable_circuit_breaker: bool = True,
     ) -> None:
         self.store = store or JSONJobStore()
         self.handlers = handler_registry or get_default_registry()
@@ -77,6 +83,14 @@ class Scheduler:
         self.result_chains: Optional[ResultChainManager] = None
         if enable_result_chaining:
             self.result_chains = ResultChainManager(scheduler=self)
+
+        # v0.6.0: Circuit breaker registry for flaky handler protection
+        self.circuit_breakers: Optional[CircuitBreakerRegistry] = None
+        if enable_circuit_breaker:
+            self.circuit_breakers = CircuitBreakerRegistry()
+
+        # v0.6.0: Track condition-skip counts
+        self._condition_skips: dict[str, int] = {}
 
     # ── Job CRUD ──────────────────────────────────────────────
 
@@ -189,7 +203,12 @@ class Scheduler:
         return await self._execute_job(job)
 
     async def run_due_jobs(self) -> list[JobExecution]:
-        """Find and execute all due jobs, respecting priority order."""
+        """Find and execute all due jobs, respecting priority order.
+
+        v0.6.0 additions:
+        - Circuit breaker: skips jobs whose handler circuit is OPEN
+        - Conditional execution: skips jobs whose execution_condition evaluates False
+        """
         now = datetime.now(timezone.utc)
         due_jobs = []
 
@@ -206,6 +225,38 @@ class Scheduler:
                 # Check dependencies
                 if not self._check_dependencies_met(job):
                     continue
+
+                # v0.6.0: Check circuit breaker
+                if self.circuit_breakers is not None:
+                    cb = self.circuit_breakers.get(job.handler)
+                    if cb is not None and not cb.allow():
+                        logger.info(
+                            f"Job '{job.name}' skipped — circuit OPEN for "
+                            f"handler '{job.handler}'"
+                        )
+                        # Reschedule to after cooldown
+                        continue
+
+                # v0.6.0: Check execution condition
+                if job.execution_condition:
+                    if not self._evaluate_job_condition(job):
+                        self._condition_skips[job.id] = (
+                            self._condition_skips.get(job.id, 0) + 1
+                        )
+                        logger.info(
+                            f"Job '{job.name}' skipped — execution_condition "
+                            f"evaluated False (skip #{self._condition_skips[job.id]})"
+                        )
+                        # Reschedule for next cron tick
+                        job.next_run_at = job.compute_next_run()
+                        if job.next_run_at is None:
+                            # Non-recurring job with unmet condition
+                            job.status = JobStatus.COMPLETED
+                            job.enabled = False
+                        job.mark_updated()
+                        self.store.save_job(job)
+                        continue
+
                 due_jobs.append(job)
 
         # Sort by priority (high first)
@@ -224,6 +275,39 @@ class Scheduler:
                     self._semaphore.release()
 
         return results
+
+    def _evaluate_job_condition(self, job: Job) -> bool:
+        """Evaluate a job's execution_condition. Returns True if it should run."""
+        from agent_scheduler.conditions import (
+            ConditionContext,
+            evaluate_condition,
+            ConditionEvaluationError,
+        )
+
+        # Build context from job state
+        last_result = None
+        last_status = None
+        history = self.store.get_executions(job.id, limit=1)
+        if history:
+            last = history[0]
+            last_result = last.result
+            last_status = last.status.value
+
+        context = ConditionContext(
+            payload=job.payload,
+            last_result=last_result,
+            last_status=last_status,
+            job_tags=job.tags,
+            job_metadata=job.metadata,
+            run_count=job.run_count,
+            fail_count=job.fail_count,
+        )
+
+        try:
+            return evaluate_condition(job.execution_condition, context)
+        except ConditionEvaluationError as e:
+            logger.error(f"Job '{job.name}' condition error: {e}")
+            return False  # Fail-safe: skip on error
 
     async def _execute_job(self, job: Job) -> JobExecution:
         """Execute a single job with retry logic."""
@@ -245,6 +329,14 @@ class Scheduler:
         for attempt in range(max_attempts):
             execution.retry_attempt = attempt
             result = await self.handlers.execute(job.handler, job.payload, job.timeout)
+
+            # v0.6.0: Record circuit breaker outcome
+            if self.circuit_breakers is not None:
+                cb = self.circuit_breakers.get_or_create(job.handler)
+                if result.success:
+                    cb.record_success()
+                else:
+                    cb.record_failure(result.error)
 
             if result.success:
                 execution.status = ExecutionStatus.SUCCESS
@@ -499,3 +591,50 @@ class Scheduler:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    # ── v0.6.0: Circuit Breaker & Conditions ─────────────────
+
+    def get_circuit_breaker_status(self) -> list[dict[str, Any]]:
+        """Get the status of all circuit breakers."""
+        if self.circuit_breakers is None:
+            return []
+        return [cb.to_dict() for cb in self.circuit_breakers.list_breakers()]
+
+    def get_circuit_breaker(self, handler: str) -> Optional[dict[str, Any]]:
+        """Get the status of a specific handler's circuit breaker."""
+        if self.circuit_breakers is None:
+            return None
+        cb = self.circuit_breakers.get(handler)
+        return cb.to_dict() if cb else None
+
+    def reset_circuit_breaker(self, handler: str) -> bool:
+        """Manually reset a circuit breaker to CLOSED state."""
+        if self.circuit_breakers is None:
+            return False
+        cb = self.circuit_breakers.get(handler)
+        if cb is None:
+            return False
+        cb.reset()
+        return True
+
+    def reset_all_circuit_breakers(self) -> int:
+        """Reset all circuit breakers. Returns count of reset breakers."""
+        if self.circuit_breakers is None:
+            return 0
+        return self.circuit_breakers.reset_all()
+
+    def get_condition_skip_count(self, job_id: str) -> int:
+        """Get the number of times a job was skipped due to its execution_condition."""
+        return self._condition_skips.get(job_id, 0)
+
+    def configure_circuit_breaker(
+        self,
+        handler: str,
+        config: CircuitConfig,
+    ) -> None:
+        """Configure circuit breaker settings for a handler."""
+        if self.circuit_breakers is None:
+            self.circuit_breakers = CircuitBreakerRegistry()
+        cb = self.circuit_breakers.get_or_create(handler, config=config)
+        # Update config on existing breaker
+        cb.config = config
