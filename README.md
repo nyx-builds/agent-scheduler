@@ -1,4 +1,18 @@
+<div align="center">
+
 # Agent Scheduler
+
+**Task scheduling engine for autonomous AI agents**
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Tests: 675](https://img.shields.io/badge/tests-675%20passing-brightgreen.svg)](#testing)
+[![MCP](https://img.shields.io/badge/MCP-server-7c3aed)](https://modelcontextprotocol.io)
+[![Version: 0.6.0](https://img.shields.io/badge/version-0.6.0-blue.svg)](#changelog)
+
+</div>
+
+---
 
 Task scheduling engine for autonomous agents — cron-like recurring jobs, one-time delayed tasks, priority queues, retry logic, webhooks, templates, job groups, API key auth, SQLite backend, MCP server, and REST API.
 
