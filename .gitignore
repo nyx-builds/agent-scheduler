@@ -11,3 +11,7 @@ build/
 *.json
 !pyproject.toml
 .env
+
+# Coverage
+.coverage
+htmlcov/
